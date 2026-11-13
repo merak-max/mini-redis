@@ -1,18 +1,58 @@
 package main
 
 import (
+	"math/rand"
 	"sync"
 	"time"
 )
 
 func (s *Store) removeExpired() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	maxRounds := 5
 
-	now := time.Now()
-	for key, entry := range s.data {
-		if entry.expired(now) {
-			delete(s.data, key)
+	for round := 0; round < maxRounds; round++ {
+		s.mu.Lock()
+
+		keys := make([]string, 0)
+
+		for key := range s.data {
+			keys = append(keys, key)
+		}
+
+		if len(keys) == 0 {
+			s.mu.Unlock()
+			break
+		}
+
+		rand.Shuffle(len(keys), func(i, j int) {
+			keys[i], keys[j] = keys[j], keys[i]
+		})
+
+		sampleSize := 20
+		if len(keys) < sampleSize {
+			sampleSize = len(keys)
+		}
+
+		sample := keys[:sampleSize]
+
+		expiredCount := 0
+
+		for _, key := range sample {
+			entry := s.data[key]
+
+			if !entry.expiresAt.IsZero() &&
+				!time.Now().Before(entry.expiresAt) {
+				delete(s.data, key)
+				expiredCount++
+			}
+		}
+
+		percentage := float64(expiredCount) /
+			float64(sampleSize) * 100
+
+		s.mu.Unlock()
+
+		if percentage <= 25 {
+			break
 		}
 	}
 }

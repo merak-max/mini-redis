@@ -46,6 +46,79 @@ func TestStoreTTL(t *testing.T) {
 		t.Fatalf("Expected key to expire, got value: %s", value)
 	}
 }
+func TestSampledExpirationAllExpired(t *testing.T) {
+	s := NewStore()
+
+	// 1. Insert 20 keys with 100ms TTL
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("key%d", i)
+		s.SetWithTTL(key, "value", 100*time.Millisecond)
+	}
+
+	// 2. Wait for keys to expire
+	time.Sleep(150 * time.Millisecond)
+
+	// 3. Run sampled cleanup
+	s.removeExpired()
+
+	// 4. Check remaining keys
+	s.mu.RLock()
+	remaining := len(s.data)
+	s.mu.RUnlock()
+
+	if remaining != 0 {
+		t.Fatalf("Expected 0 keys, got %d", remaining)
+	}
+}
+func TestSampledExpirationNoneExpired(t *testing.T) {
+	s := NewStore()
+
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("key%d", i)
+		s.Set(key, "value")
+	}
+
+	s.removeExpired()
+
+	s.mu.RLock()
+	remaining := len(s.data)
+	s.mu.RUnlock()
+
+	if remaining != 20 {
+		t.Fatalf("Expected 20 keys, got %d", remaining)
+	}
+}
+func TestSampledExpirationMixedKeys(t *testing.T) {
+	s := NewStore()
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("expired%d", i)
+		s.SetWithTTL(key, "value", 100*time.Millisecond)
+	}
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("live%d", i)
+		s.Set(key, "value")
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	s.removeExpired()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for i := 0; i < 10; i++ {
+		if _, exists := s.data[fmt.Sprintf("live%d", i)]; !exists {
+			t.Fatalf("Live key live%d was incorrectly deleted", i)
+		}
+	}
+
+	for i := 0; i < 10; i++ {
+		if _, exists := s.data[fmt.Sprintf("expired%d", i)]; exists {
+			t.Fatalf("Expired key expired%d was not deleted", i)
+		}
+	}
+}
 
 // DEL must not count a key whose TTL has passed, even if the
 // background cleanup hasn't removed it yet.
