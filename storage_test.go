@@ -120,6 +120,84 @@ func TestSampledExpirationMixedKeys(t *testing.T) {
 	}
 }
 
+func TestActiveExpiration(t *testing.T) {
+	s := NewStore()
+
+	s.SetWithTTL("name", "Hemant", 100*time.Millisecond)
+
+	go s.StartCleanup(20 * time.Millisecond)
+
+	time.Sleep(200 * time.Millisecond)
+
+	s.mu.RLock()
+	_, exists := s.data["name"]
+	s.mu.RUnlock()
+
+	if exists {
+		t.Fatal("Expected active cleanup to delete expired key")
+	}
+}
+
+// SET without EX must make a key permanent again, as in Redis.
+// This also checks the two maps stay in sync.
+func TestSetClearsTTL(t *testing.T) {
+	s := NewStore()
+	s.SetWithTTL("k", "old", 20*time.Millisecond)
+	s.Set("k", "new")
+	time.Sleep(40 * time.Millisecond)
+
+	if v, ok := s.Get("k"); !ok || v != "new" {
+		t.Fatalf("Get(k) = %q, %v; want \"new\", true (TTL should be cleared)", v, ok)
+	}
+	s.mu.RLock()
+	_, hasTTL := s.expires["k"]
+	s.mu.RUnlock()
+	if hasTTL {
+		t.Fatal("k still listed in expires after plain SET")
+	}
+}
+
+// One cleanup cycle must do bounded work, however many keys are expired.
+func TestActiveExpiryBoundedWork(t *testing.T) {
+	s := NewStore()
+	for i := 0; i < 1000; i++ {
+		s.SetWithTTL(fmt.Sprintf("k%d", i), "v", time.Millisecond)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	s.removeExpired()
+
+	s.mu.RLock()
+	removed := 1000 - len(s.data)
+	s.mu.RUnlock()
+	if max := expireSampleSize * expireMaxRounds; removed == 0 || removed > max {
+		t.Fatalf("one cycle removed %d keys, want between 1 and %d", removed, max)
+	}
+}
+
+// A few expired keys hidden among many permanent ones must still be found,
+// because the sample only looks at keys that have a TTL.
+func TestActiveExpiryFindsFewAmongMany(t *testing.T) {
+	s := NewStore()
+	for i := 0; i < 10000; i++ {
+		s.Set(fmt.Sprintf("perm%d", i), "v")
+	}
+	for i := 0; i < 50; i++ {
+		s.SetWithTTL(fmt.Sprintf("tmp%d", i), "v", time.Millisecond)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	for c := 0; c < 5; c++ {
+		s.removeExpired()
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.data) != 10000 || len(s.expires) != 0 {
+		t.Fatalf("after cleanup: %d keys, %d with TTL; want 10000 and 0", len(s.data), len(s.expires))
+	}
+}
+
 // DEL must not count a key whose TTL has passed, even if the
 // background cleanup hasn't removed it yet.
 func TestStoreDelIgnoresExpired(t *testing.T) {

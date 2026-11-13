@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
-	"time"
 )
 
 // These tests expect, in package main:
@@ -124,22 +123,5 @@ func TestReadCommandMalformed(t *testing.T) {
 				t.Fatalf("got bare io.EOF; mid-command EOF should be a different error (e.g. io.ErrUnexpectedEOF)")
 			}
 		})
-	}
-}
-func TestActiveExpiration(t *testing.T) {
-	s := NewStore()
-
-	s.SetWithTTL("name", "Hemant", 100*time.Millisecond)
-
-	go s.StartCleanup(20 * time.Millisecond)
-
-	time.Sleep(200 * time.Millisecond)
-
-	s.mu.RLock()
-	_, exists := s.data["name"]
-	s.mu.RUnlock()
-
-	if exists {
-		t.Fatal("Expected active cleanup to delete expired key")
 	}
 }
