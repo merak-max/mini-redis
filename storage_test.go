@@ -47,6 +47,19 @@ func TestStoreTTL(t *testing.T) {
 	}
 }
 
+// DEL must not count a key whose TTL has passed, even if the
+// background cleanup hasn't removed it yet.
+func TestStoreDelIgnoresExpired(t *testing.T) {
+	s := NewStore()
+	s.SetWithTTL("old", "v", 10*time.Millisecond)
+	s.Set("live", "v")
+	time.Sleep(30 * time.Millisecond)
+
+	if n := s.Del("old", "live"); n != 1 {
+		t.Fatalf("Del count = %d, want 1 (only the live key)", n)
+	}
+}
+
 // Many goroutines hit the store at once, like many clients.
 // Without the mutex this crashes with "concurrent map writes",
 // and `go test -race` reports the data race.

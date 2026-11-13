@@ -9,9 +9,9 @@ func (s *Store) removeExpired() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
 	for key, entry := range s.data {
-		if !entry.expiresAt.IsZero() &&
-			!time.Now().Before(entry.expiresAt) {
+		if entry.expired(now) {
 			delete(s.data, key)
 		}
 	}
@@ -32,7 +32,12 @@ func (s *Store) StartCleanup(interval time.Duration) {
 
 type Entry struct {
 	value     string
-	expiresAt time.Time
+	expiresAt time.Time // zero means the key never expires
+}
+
+// expired is the single expiry rule used by every read and delete path.
+func (e Entry) expired(now time.Time) bool {
+	return !e.expiresAt.IsZero() && !now.Before(e.expiresAt)
 }
 
 type Store struct {
@@ -56,8 +61,7 @@ func (s *Store) Get(key string) (string, bool) {
 		return "", false
 	}
 
-	if !entry.expiresAt.IsZero() &&
-		!time.Now().Before(entry.expiresAt) {
+	if entry.expired(time.Now()) {
 		delete(s.data, key)
 		return "", false
 	}
@@ -92,11 +96,17 @@ func (s *Store) Del(keys ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
 	count := 0
 
 	for _, key := range keys {
-		if _, exists := s.data[key]; exists {
-			delete(s.data, key)
+		entry, exists := s.data[key]
+		if !exists {
+			continue
+		}
+		delete(s.data, key)
+		// An expired key is already logically gone, so it doesn't count.
+		if !entry.expired(now) {
 			count++
 		}
 	}

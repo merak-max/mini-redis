@@ -75,33 +75,28 @@ func handleConnection(conn net.Conn) {
 			}
 
 		case "SET":
-			if len(args) == 3 {
-				// Normal SET
+			// Bad arguments are still a well-formed command, so we reply with an
+			// error and keep the connection open (break, not return).
+			switch len(args) {
+			case 3:
 				store.Set(args[1], args[2])
-				fmt.Fprint(conn, "+OK\r\n")
+				_, err = io.WriteString(conn, "+OK\r\n")
 
-			} else if len(args) == 5 {
-				// SET with EX seconds
-
+			case 5: // SET key value EX seconds
 				if !strings.EqualFold(args[3], "EX") {
-					fmt.Fprint(conn, "-ERR syntax error\r\n")
-					return
+					_, err = io.WriteString(conn, "-ERR syntax error\r\n")
+					break
 				}
-
-				seconds, err := strconv.Atoi(args[4])
-
-				if err != nil || seconds <= 0 {
-					fmt.Fprint(conn, "-ERR invalid expire time\r\n")
-					return
+				seconds, convErr := strconv.Atoi(args[4])
+				if convErr != nil || seconds <= 0 {
+					_, err = io.WriteString(conn, "-ERR invalid expire time in 'set' command\r\n")
+					break
 				}
+				store.SetWithTTL(args[1], args[2], time.Duration(seconds)*time.Second)
+				_, err = io.WriteString(conn, "+OK\r\n")
 
-				ttl := time.Duration(seconds) * time.Second
-				store.SetWithTTL(args[1], args[2], ttl)
-				fmt.Fprint(conn, "+OK\r\n")
-
-			} else {
-				fmt.Fprint(conn, "-ERR wrong number of arguments for 'set' command\r\n")
-				return
+			default:
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'set' command\r\n")
 			}
 		case "GET":
 			if len(args) != 2 {
