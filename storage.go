@@ -122,6 +122,46 @@ func (s *Store) LLen(key string) (int, error) {
 	return value.list.Len(), nil
 }
 
+// Pop removes and returns one element from the front (LPOP) or back (RPOP).
+// ok is false when the key is missing, expired, or the list is empty.
+// When the last element is removed the key is deleted, as in Redis:
+// Redis never keeps an empty list around.
+func (s *Store) Pop(key string, front bool) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key, time.Now()) {
+		s.deleteKey(key)
+		return "", false, nil
+	}
+
+	value, exists := s.data[key]
+	if !exists {
+		return "", false, nil
+	}
+	if value.typ != ListType {
+		return "", false, errWrongType
+	}
+
+	elem := value.list.Back()
+	if front {
+		elem = value.list.Front()
+	}
+	if elem == nil { // defensive: lists are deleted when they become empty
+		s.deleteKey(key)
+		return "", false, nil
+	}
+
+	value.list.Remove(elem)
+	if value.list.Len() == 0 {
+		s.deleteKey(key)
+	}
+
+	// list.Element stores its value as `any`, so we assert it back to string.
+	// Push only ever stores strings, so this cannot fail.
+	return elem.Value.(string), true, nil
+}
+
 // --- public API ---
 
 func (s *Store) Get(key string) (string, bool, error) {

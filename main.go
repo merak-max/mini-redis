@@ -124,7 +124,8 @@ func handleConnection(conn net.Conn) {
 			}
 		case "LPUSH", "RPUSH":
 			if len(args) < 3 {
-				_, err = io.WriteString(conn, "-ERR wrong number of arguments\r\n")
+				// One case serves both commands, so the name comes from args[0].
+				_, err = fmt.Fprintf(conn, "-ERR wrong number of arguments for '%s' command\r\n", strings.ToLower(args[0]))
 				break
 			}
 
@@ -136,6 +137,24 @@ func handleConnection(conn net.Conn) {
 				_, err = fmt.Fprintf(conn, "-%s\r\n", pushErr.Error())
 			} else {
 				_, err = fmt.Fprintf(conn, ":%d\r\n", length)
+			}
+
+		case "LPOP", "RPOP":
+			if len(args) != 2 {
+				_, err = fmt.Fprintf(conn, "-ERR wrong number of arguments for '%s' command\r\n", strings.ToLower(args[0]))
+				break
+			}
+
+			front := strings.EqualFold(args[0], "LPOP")
+			item, ok, popErr := store.Pop(args[1], front)
+
+			switch {
+			case popErr != nil: // the key holds a string
+				_, err = fmt.Fprintf(conn, "-%s\r\n", popErr.Error())
+			case ok:
+				err = writeBulk(conn, item)
+			default: // missing key or empty list
+				_, err = io.WriteString(conn, "$-1\r\n")
 			}
 
 		case "LLEN":
