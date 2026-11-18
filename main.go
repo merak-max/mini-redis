@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -12,6 +13,10 @@ import (
 )
 
 const listenAddr = ":6380"
+
+// maxExpireSeconds is the largest EX value that fits in a time.Duration
+// (int64 nanoseconds), about 292 years. Anything larger would overflow.
+const maxExpireSeconds = int64(math.MaxInt64) / int64(time.Second)
 
 // One shared Store for all client connections.
 var store = NewStore()
@@ -75,29 +80,32 @@ func handleConnection(conn net.Conn) {
 			}
 
 		case "SET":
-			// Bad arguments are still a well-formed command, so we reply with an
-			// error and keep the connection open (break, not return).
 			switch len(args) {
 			case 3:
 				store.Set(args[1], args[2])
 				_, err = io.WriteString(conn, "+OK\r\n")
 
-			case 5: // SET key value EX seconds
+			case 5:
 				if !strings.EqualFold(args[3], "EX") {
 					_, err = io.WriteString(conn, "-ERR syntax error\r\n")
 					break
 				}
+
 				seconds, convErr := strconv.Atoi(args[4])
-				if convErr != nil || seconds <= 0 {
+				if convErr != nil || seconds <= 0 || int64(seconds) > maxExpireSeconds {
 					_, err = io.WriteString(conn, "-ERR invalid expire time in 'set' command\r\n")
 					break
 				}
-				store.SetWithTTL(args[1], args[2], time.Duration(seconds)*time.Second)
+
+				ttl := time.Duration(seconds) * time.Second
+				store.SetWithTTL(args[1], args[2], ttl)
+
 				_, err = io.WriteString(conn, "+OK\r\n")
 
 			default:
 				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'set' command\r\n")
 			}
+
 		case "GET":
 			if len(args) != 2 {
 				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'get' command\r\n")
