@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"fmt"
 	"sync"
 	"testing"
@@ -35,7 +36,7 @@ func TestSetReplacesExistingType(t *testing.T) {
 	s.mu.Lock()
 	s.data["key"] = &Value{
 		typ:  ListType,
-		list: []string{"Go", "Redis"},
+		list: listOf("Go", "Redis"),
 	}
 	s.mu.Unlock()
 
@@ -59,7 +60,7 @@ func TestGetWrongType(t *testing.T) {
 	s.mu.Lock()
 	s.data["languages"] = &Value{
 		typ:  ListType,
-		list: []string{"Go", "Redis"},
+		list: listOf("Go", "Redis"),
 	}
 	s.mu.Unlock()
 
@@ -309,4 +310,13 @@ func TestStoreConcurrent(t *testing.T) {
 			t.Fatalf("own-%d lost", w)
 		}
 	}
+}
+
+// listOf builds a *list.List from values, for tests that set up a list directly.
+func listOf(items ...string) *list.List {
+	l := list.New()
+	for _, it := range items {
+		l.PushBack(it)
+	}
+	return l
 }

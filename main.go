@@ -122,6 +122,35 @@ func handleConnection(conn net.Conn) {
 			default:
 				_, err = io.WriteString(conn, "$-1\r\n")
 			}
+		case "LPUSH", "RPUSH":
+			if len(args) < 3 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments\r\n")
+				break
+			}
+
+			front := strings.EqualFold(args[0], "LPUSH")
+
+			length, pushErr := store.Push(args[1], front, args[2:]...)
+
+			if pushErr != nil {
+				_, err = fmt.Fprintf(conn, "-%s\r\n", pushErr.Error())
+			} else {
+				_, err = fmt.Fprintf(conn, ":%d\r\n", length)
+			}
+
+		case "LLEN":
+			if len(args) != 2 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'llen' command\r\n")
+				break
+			}
+
+			length, listErr := store.LLen(args[1])
+
+			if listErr != nil {
+				_, err = fmt.Fprintf(conn, "-%s\r\n", listErr.Error())
+			} else {
+				_, err = fmt.Fprintf(conn, ":%d\r\n", length)
+			}
 
 		case "DEL":
 			if len(args) < 2 {

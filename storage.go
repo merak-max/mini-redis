@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"errors"
 	"sync"
 	"time"
@@ -20,7 +21,7 @@ const (
 type Value struct {
 	typ  ValueType
 	str  string
-	list []string
+	list *list.List
 }
 
 // Store keeps values and expiry times in two maps, like real Redis does.
@@ -53,12 +54,6 @@ func (s *Store) setKey(key, value string, expiresAt time.Time) {
 		s.expires[key] = expiresAt
 	}
 }
-func (s *Store) setList(key string, list []string) {
-	s.data[key] = &Value{
-		typ:  ListType,
-		list: list,
-	}
-}
 
 func (s *Store) deleteKey(key string) {
 	delete(s.data, key)
@@ -69,6 +64,62 @@ func (s *Store) deleteKey(key string) {
 func (s *Store) isExpired(key string, now time.Time) bool {
 	at, hasTTL := s.expires[key]
 	return hasTTL && !now.Before(at)
+}
+func (s *Store) Push(key string, front bool, values ...string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
+	// Expired keys behave like missing keys.
+	if s.isExpired(key, now) {
+		s.deleteKey(key)
+	}
+
+	value, exists := s.data[key]
+
+	if exists && value.typ != ListType {
+		return 0, errWrongType
+	}
+
+	if !exists {
+		value = &Value{
+			typ:  ListType,
+			list: list.New(),
+		}
+		s.data[key] = value
+	}
+
+	for _, item := range values {
+		if front {
+			value.list.PushFront(item)
+		} else {
+			value.list.PushBack(item)
+		}
+	}
+
+	return value.list.Len(), nil
+}
+func (s *Store) LLen(key string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key, time.Now()) {
+		s.deleteKey(key)
+		return 0, nil
+	}
+
+	value, exists := s.data[key]
+
+	if !exists {
+		return 0, nil
+	}
+
+	if value.typ != ListType {
+		return 0, errWrongType
+	}
+
+	return value.list.Len(), nil
 }
 
 // --- public API ---
@@ -94,27 +145,7 @@ func (s *Store) Get(key string) (string, bool, error) {
 
 	return value.str, true, nil
 }
-func (s *Store) getList(key string) ([]string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	value, exists := s.data[key]
-
-	if !exists {
-		return nil, false
-	}
-
-	if s.isExpired(key, time.Now()) {
-		s.deleteKey(key)
-		return nil, false
-	}
-
-	if value.typ != ListType {
-		return nil, false
-	}
-
-	return value.list, true
-}
 func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
