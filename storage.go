@@ -1,9 +1,27 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
+
+var errWrongType = errors.New(
+	"WRONGTYPE Operation against a key holding the wrong kind of value",
+)
+
+type ValueType int
+
+const (
+	StringType ValueType = iota
+	ListType
+)
+
+type Value struct {
+	typ  ValueType
+	str  string
+	list []string
+}
 
 // Store keeps values and expiry times in two maps, like real Redis does.
 // Invariant: every key in expires is also in data. A key in data but not
@@ -11,13 +29,13 @@ import (
 // so the invariant lives in those two places.
 type Store struct {
 	mu      sync.RWMutex
-	data    map[string]string
+	data    map[string]*Value    // every key; Value.typ says string or list
 	expires map[string]time.Time // only keys that have a TTL
 }
 
 func NewStore() *Store {
 	return &Store{
-		data:    make(map[string]string),
+		data:    make(map[string]*Value),
 		expires: make(map[string]time.Time),
 	}
 }
@@ -27,11 +45,18 @@ func NewStore() *Store {
 // setKey stores value. A zero expiresAt means "no TTL", which also clears
 // any TTL the key had before (SET without EX makes a key permanent).
 func (s *Store) setKey(key, value string, expiresAt time.Time) {
-	s.data[key] = value
+	s.data[key] = &Value{typ: StringType, str: value}
+
 	if expiresAt.IsZero() {
 		delete(s.expires, key)
 	} else {
 		s.expires[key] = expiresAt
+	}
+}
+func (s *Store) setList(key string, list []string) {
+	s.data[key] = &Value{
+		typ:  ListType,
+		list: list,
 	}
 }
 
@@ -48,21 +73,48 @@ func (s *Store) isExpired(key string, now time.Time) bool {
 
 // --- public API ---
 
-func (s *Store) Get(key string) (string, bool) {
+func (s *Store) Get(key string) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	value, exists := s.data[key]
-	if !exists {
-		return "", false
-	}
-	if s.isExpired(key, time.Now()) {
-		s.deleteKey(key) // lazy expiry
-		return "", false
-	}
-	return value, true
-}
 
+	if !exists {
+		return "", false, nil
+	}
+
+	if s.isExpired(key, time.Now()) {
+		s.deleteKey(key)
+		return "", false, nil
+	}
+
+	if value.typ != StringType {
+		return "", false, errWrongType
+	}
+
+	return value.str, true, nil
+}
+func (s *Store) getList(key string) ([]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	value, exists := s.data[key]
+
+	if !exists {
+		return nil, false
+	}
+
+	if s.isExpired(key, time.Now()) {
+		s.deleteKey(key)
+		return nil, false
+	}
+
+	if value.typ != ListType {
+		return nil, false
+	}
+
+	return value.list, true
+}
 func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

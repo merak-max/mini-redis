@@ -7,16 +7,76 @@ import (
 	"time"
 )
 
+func TestStoreStringType(t *testing.T) {
+	s := NewStore()
+
+	s.Set("name", "Hemant")
+
+	s.mu.RLock()
+	value := s.data["name"]
+	s.mu.RUnlock()
+
+	if value == nil {
+		t.Fatal("Expected key to exist")
+	}
+
+	if value.typ != StringType {
+		t.Fatal("Expected StringType")
+	}
+
+	if value.str != "Hemant" {
+		t.Fatalf("Got %q, want Hemant", value.str)
+	}
+}
+
+func TestSetReplacesExistingType(t *testing.T) {
+	s := NewStore()
+
+	s.mu.Lock()
+	s.data["key"] = &Value{
+		typ:  ListType,
+		list: []string{"Go", "Redis"},
+	}
+	s.mu.Unlock()
+
+	s.Set("key", "Hello")
+
+	s.mu.RLock()
+	value := s.data["key"]
+	s.mu.RUnlock()
+
+	if value.typ != StringType {
+		t.Fatal("SET should replace existing value with StringType")
+	}
+
+	if value.str != "Hello" {
+		t.Fatalf("Got %q, want Hello", value.str)
+	}
+}
+func TestGetWrongType(t *testing.T) {
+	s := NewStore()
+
+	s.mu.Lock()
+	s.data["languages"] = &Value{
+		typ:  ListType,
+		list: []string{"Go", "Redis"},
+	}
+	s.mu.Unlock()
+
+	if _, ok, _ := s.Get("languages"); ok {
+		t.Fatal("GET should not return a list as a string")
+	}
+}
 func TestStoreBasic(t *testing.T) {
 	s := NewStore()
 
-	if _, ok := s.Get("missing"); ok {
+	if _, ok, _ := s.Get("missing"); ok {
 		t.Fatal("Get on missing key: want ok=false")
 	}
 
 	s.Set("k", "v1")
 	s.Set("k", "v2") // overwrite
-	if v, ok := s.Get("k"); !ok || v != "v2" {
+	if v, ok, _ := s.Get("k"); !ok || v != "v2" {
 		t.Fatalf("Get(k) = %q, %v; want \"v2\", true", v, ok)
 	}
 
@@ -25,7 +85,7 @@ func TestStoreBasic(t *testing.T) {
 	if n := s.Del("k", "a", "nope", "k"); n != 2 {
 		t.Fatalf("Del count = %d, want 2", n)
 	}
-	if _, ok := s.Get("k"); ok {
+	if _, ok, _ := s.Get("k"); ok {
 		t.Fatal("key still present after Del")
 	}
 }
@@ -34,14 +94,14 @@ func TestStoreTTL(t *testing.T) {
 
 	s.SetWithTTL("name", "Hemant", 100*time.Millisecond)
 
-	value, ok := s.Get("name")
+	value, ok, _ := s.Get("name")
 	if !ok || value != "Hemant" {
 		t.Fatal("Expected key to exist before expiration")
 	}
 
 	time.Sleep(150 * time.Millisecond)
 
-	value, ok = s.Get("name")
+	value, ok, _ = s.Get("name")
 	if ok {
 		t.Fatalf("Expected key to expire, got value: %s", value)
 	}
@@ -146,7 +206,7 @@ func TestSetClearsTTL(t *testing.T) {
 	s.Set("k", "new")
 	time.Sleep(40 * time.Millisecond)
 
-	if v, ok := s.Get("k"); !ok || v != "new" {
+	if v, ok, _ := s.Get("k"); !ok || v != "new" {
 		t.Fatalf("Get(k) = %q, %v; want \"new\", true (TTL should be cleared)", v, ok)
 	}
 	s.mu.RLock()
@@ -245,7 +305,7 @@ func TestStoreConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 	for w := 0; w < workers; w++ {
-		if _, ok := s.Get(fmt.Sprintf("own-%d", w)); !ok {
+		if _, ok, _ := s.Get(fmt.Sprintf("own-%d", w)); !ok {
 			t.Fatalf("own-%d lost", w)
 		}
 	}

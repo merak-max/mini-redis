@@ -112,11 +112,14 @@ func handleConnection(conn net.Conn) {
 				break
 			}
 
-			value, exists := store.Get(args[1])
+			value, exists, getErr := store.Get(args[1])
 
-			if exists {
+			switch {
+			case getErr != nil: // e.g. the key holds a list
+				_, err = io.WriteString(conn, "-"+getErr.Error()+"\r\n")
+			case exists:
 				err = writeBulk(conn, value)
-			} else {
+			default:
 				_, err = io.WriteString(conn, "$-1\r\n")
 			}
 
