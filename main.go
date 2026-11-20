@@ -171,6 +171,24 @@ func handleConnection(conn net.Conn) {
 				_, err = fmt.Fprintf(conn, ":%d\r\n", length)
 			}
 
+		case "LRANGE": // LRANGE key start stop
+			if len(args) != 4 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'lrange' command\r\n")
+				break
+			}
+			start, err1 := strconv.Atoi(args[2])
+			stop, err2 := strconv.Atoi(args[3])
+			if err1 != nil || err2 != nil {
+				_, err = io.WriteString(conn, "-ERR value is not an integer or out of range\r\n")
+				break
+			}
+			items, listErr := store.LRange(args[1], start, stop)
+			if listErr != nil {
+				_, err = fmt.Fprintf(conn, "-%s\r\n", listErr.Error())
+				break
+			}
+			err = writeArray(conn, items)
+
 		case "DEL":
 			if len(args) < 2 {
 				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'del' command\r\n")

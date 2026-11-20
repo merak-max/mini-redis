@@ -164,6 +164,41 @@ func (s *Store) Pop(key string, front bool) (string, bool, error) {
 	return elem.Value.(string), true, nil
 }
 
+// LRange returns elements start..stop (inclusive, negative counts from the
+// end). A missing key gives an empty result. container/list has no index
+// lookup, so we walk from the front: O(start + count).
+func (s *Store) LRange(key string, start, stop int) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key, time.Now()) {
+		s.deleteKey(key)
+		return nil, nil
+	}
+	value, exists := s.data[key]
+	if !exists {
+		return nil, nil
+	}
+	if value.typ != ListType {
+		return nil, errWrongType
+	}
+
+	start, stop, ok := normalizeRange(start, stop, value.list.Len())
+	if !ok {
+		return nil, nil
+	}
+
+	out := make([]string, 0, stop-start+1)
+	i := 0
+	for e := value.list.Front(); e != nil && i <= stop; e = e.Next() {
+		if i >= start {
+			out = append(out, e.Value.(string))
+		}
+		i++
+	}
+	return out, nil
+}
+
 // --- public API ---
 
 func (s *Store) Get(key string) (string, bool, error) {

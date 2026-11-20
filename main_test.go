@@ -77,8 +77,13 @@ func (c *conn) expect(want string, args ...string) {
 	}
 }
 
-// The handler uses one global store, so each test uses its own key names.
-func key(t *testing.T, name string) string { return t.Name() + ":" + name }
+// The handler uses one global store, so each test uses its own key names,
+// and deletes them afterwards so `go test -count=N` reruns start clean.
+func key(t *testing.T, name string) string {
+	k := t.Name() + ":" + name
+	t.Cleanup(func() { store.Del(k) })
+	return k
+}
 
 func TestPing(t *testing.T) {
 	c := newConn(t)
