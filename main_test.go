@@ -181,3 +181,15 @@ func TestSetEXOverflowNeverLies(t *testing.T) {
 		t.Fatalf("unexpected reply %q", got)
 	}
 }
+
+const wrongType = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+
+// arr builds the expected RESP array reply for LRANGE.
+func arr(items ...string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(items))
+	for _, it := range items {
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(it), it)
+	}
+	return b.String()
+}

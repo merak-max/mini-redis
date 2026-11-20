@@ -16,12 +16,14 @@ type ValueType int
 const (
 	StringType ValueType = iota
 	ListType
+	ZSetType
 )
 
 type Value struct {
 	typ  ValueType
 	str  string
 	list *list.List
+	zset *zset // used when typ == ZSetType (see zset.go)
 }
 
 // Store keeps values and expiry times in two maps, like real Redis does.

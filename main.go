@@ -180,6 +180,120 @@ func handleConnection(conn net.Conn) {
 			count := store.Del(args[1:]...)
 			_, err = fmt.Fprintf(conn, ":%d\r\n", count)
 
+		case "ZADD": // ZADD key score member [score member ...]
+			if len(args) < 4 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'zadd' command\r\n")
+				break
+			}
+			if len(args)%2 != 0 { // a score without a member
+				_, err = io.WriteString(conn, "-ERR syntax error\r\n")
+				break
+			}
+			members := make([]ZMember, 0, (len(args)-2)/2)
+			badScore := false
+			for i := 2; i < len(args); i += 2 {
+				score, ok := parseScore(args[i])
+				if !ok {
+					badScore = true
+					break
+				}
+				members = append(members, ZMember{Member: args[i+1], Score: score})
+			}
+			if badScore {
+				_, err = io.WriteString(conn, "-ERR value is not a valid float\r\n")
+				break
+			}
+			added, zErr := store.ZAdd(args[1], members)
+			if zErr != nil {
+				_, err = fmt.Fprintf(conn, "-%s\r\n", zErr.Error())
+			} else {
+				_, err = fmt.Fprintf(conn, ":%d\r\n", added)
+			}
+
+		case "ZREM": // ZREM key member [member ...]
+			if len(args) < 3 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'zrem' command\r\n")
+				break
+			}
+			removed, zErr := store.ZRem(args[1], args[2:]...)
+			if zErr != nil {
+				_, err = fmt.Fprintf(conn, "-%s\r\n", zErr.Error())
+			} else {
+				_, err = fmt.Fprintf(conn, ":%d\r\n", removed)
+			}
+
+		case "ZSCORE": // ZSCORE key member
+			if len(args) != 3 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'zscore' command\r\n")
+				break
+			}
+			score, ok, zErr := store.ZScore(args[1], args[2])
+			switch {
+			case zErr != nil:
+				_, err = fmt.Fprintf(conn, "-%s\r\n", zErr.Error())
+			case ok:
+				err = writeBulk(conn, formatScore(score))
+			default:
+				_, err = io.WriteString(conn, "$-1\r\n")
+			}
+
+		case "ZCARD": // ZCARD key
+			if len(args) != 2 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'zcard' command\r\n")
+				break
+			}
+			n, zErr := store.ZCard(args[1])
+			if zErr != nil {
+				_, err = fmt.Fprintf(conn, "-%s\r\n", zErr.Error())
+			} else {
+				_, err = fmt.Fprintf(conn, ":%d\r\n", n)
+			}
+
+		case "ZRANK": // ZRANK key member
+			if len(args) != 3 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'zrank' command\r\n")
+				break
+			}
+			rank, ok, zErr := store.ZRank(args[1], args[2])
+			switch {
+			case zErr != nil:
+				_, err = fmt.Fprintf(conn, "-%s\r\n", zErr.Error())
+			case ok:
+				_, err = fmt.Fprintf(conn, ":%d\r\n", rank)
+			default:
+				_, err = io.WriteString(conn, "$-1\r\n")
+			}
+
+		case "ZRANGE": // ZRANGE key start stop [WITHSCORES]
+			if len(args) != 4 && len(args) != 5 {
+				_, err = io.WriteString(conn, "-ERR wrong number of arguments for 'zrange' command\r\n")
+				break
+			}
+			withScores := len(args) == 5
+			if withScores && !strings.EqualFold(args[4], "WITHSCORES") {
+				_, err = io.WriteString(conn, "-ERR syntax error\r\n")
+				break
+			}
+			start, err1 := strconv.Atoi(args[2])
+			stop, err2 := strconv.Atoi(args[3])
+			if err1 != nil || err2 != nil {
+				_, err = io.WriteString(conn, "-ERR value is not an integer or out of range\r\n")
+				break
+			}
+			items, zErr := store.ZRange(args[1], start, stop)
+			if zErr != nil {
+				_, err = fmt.Fprintf(conn, "-%s\r\n", zErr.Error())
+				break
+			}
+			out := make([]string, 0, 2*len(items))
+			for _, it := range items {
+				out = append(out, it.Member)
+				if withScores {
+					out = append(out, formatScore(it.Score))
+				}
+			}
+			err = writeArray(conn, out)
+
 		default:
 			_, err = io.WriteString(conn, "-ERR unknown command\r\n")
 		}
@@ -195,4 +309,40 @@ func handleConnection(conn net.Conn) {
 func writeBulk(w io.Writer, s string) error {
 	_, err := fmt.Fprintf(w, "$%d\r\n%s\r\n", len(s), s)
 	return err
+}
+
+// writeArray sends items as a RESP array of bulk strings:
+// *<count>\r\n followed by one bulk string per item.
+func writeArray(w io.Writer, items []string) error {
+	if _, err := fmt.Fprintf(w, "*%d\r\n", len(items)); err != nil {
+		return err
+	}
+	for _, it := range items {
+		if err := writeBulk(w, it); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseScore reads a sorted-set score. Redis accepts "inf" and "-inf"
+// but never NaN, because NaN can't be ordered.
+func parseScore(s string) (float64, bool) {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(f) {
+		return 0, false
+	}
+	return f, true
+}
+
+// formatScore prints a score the way Redis does: shortest form ("1.5",
+// "3", "1e+20") and "inf"/"-inf" for infinities.
+func formatScore(f float64) string {
+	switch {
+	case math.IsInf(f, 1):
+		return "inf"
+	case math.IsInf(f, -1):
+		return "-inf"
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
 }
