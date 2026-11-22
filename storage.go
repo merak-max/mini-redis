@@ -271,21 +271,35 @@ func (s *Store) Set(key, value string) error {
 	return nil
 }
 
-// SetWithTTL logs the TTL as relative seconds. Known bug, fixed in
-// milestone 5: replay restarts the countdown. Milestone 5 logs an
-// absolute deadline instead.
+// SetWithTTL stores value with a TTL counted from now.
 func (s *Store) SetWithTTL(key, value string, ttl time.Duration) error {
-	if ttl <= 0 {
-		return nil
-	}
+	return s.SetAt(key, value, time.Now().Add(ttl))
+}
+
+// SetAt stores value with an absolute deadline, and is the only way a key
+// gets a TTL. The AOF records the deadline (SET key value PXAT <unix-ms>),
+// not the duration, so replay restores the same expiry time however long
+// the server was down. A relative TTL would restart the countdown.
+//
+// The deadline is rounded down to the millisecond, so memory and the file
+// hold exactly the same value. A deadline that has already passed deletes
+// the key, like Redis. Replay depends on this: for "SET k old" followed by
+// "SET k new PXAT <past>", k must end up missing, not "old".
+func (s *Store) SetAt(key, value string, at time.Time) error {
+	ms := at.UnixMilli()
+	at = time.UnixMilli(ms)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	seconds := strconv.FormatInt(int64(ttl/time.Second), 10)
-	if err := s.log("SET", key, value, "EX", seconds); err != nil {
+	if err := s.log("SET", key, value, "PXAT", strconv.FormatInt(ms, 10)); err != nil {
 		return err
 	}
-	s.setKey(key, value, time.Now().Add(ttl))
+	if !time.Now().Before(at) {
+		s.deleteKey(key)
+		return nil
+	}
+	s.setKey(key, value, at)
 	return nil
 }
 

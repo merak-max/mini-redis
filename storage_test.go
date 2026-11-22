@@ -226,10 +226,16 @@ func TestActiveExpiryBoundedWork(t *testing.T) {
 	}
 	time.Sleep(10 * time.Millisecond)
 
+	// Count from what is stored now: with a 1ms TTL, a slow run can expire
+	// a key before SetAt stores it, and SetAt deletes it right away.
+	s.mu.RLock()
+	before := len(s.data)
+	s.mu.RUnlock()
+
 	s.removeExpired()
 
 	s.mu.RLock()
-	removed := 1000 - len(s.data)
+	removed := before - len(s.data)
 	s.mu.RUnlock()
 	if max := expireSampleSize * expireMaxRounds; removed == 0 || removed > max {
 		t.Fatalf("one cycle removed %d keys, want between 1 and %d", removed, max)

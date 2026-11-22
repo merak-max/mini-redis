@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 // readAll parses every command in data with the real RESP parser.
@@ -246,7 +248,6 @@ func TestStoreLogsWrites(t *testing.T) {
 		}
 	}
 	run("SET", "name", "hemant")
-	run("SET", "tmp", "v", "EX", "100")
 	run("RPUSH", "jobs", "a", "b")
 	run("LPUSH", "jobs", "z")
 	run("LPOP", "jobs")
@@ -262,7 +263,6 @@ func TestStoreLogsWrites(t *testing.T) {
 
 	want := [][]string{
 		{"SET", "name", "hemant"},
-		{"SET", "tmp", "v", "EX", "100"},
 		{"RPUSH", "jobs", "a", "b"},
 		{"LPUSH", "jobs", "z"},
 		{"LPOP", "jobs"},
@@ -389,5 +389,79 @@ func TestReplayRejectsDamagedFile(t *testing.T) {
 				t.Errorf("replayed %d commands before the error, want 1", n)
 			}
 		})
+	}
+}
+
+// A TTL is logged as an absolute deadline in Unix milliseconds, matching
+// the deadline kept in memory exactly.
+func TestSetEXLogsAbsoluteDeadline(t *testing.T) {
+	s, logged := newLoggedStore(t)
+	before := time.Now()
+	var out bytes.Buffer
+	dispatch(s, &out, []string{"SET", "k", "v", "EX", "100"})
+
+	cmds := logged()
+	if len(cmds) != 1 || len(cmds[0]) != 5 || cmds[0][3] != "PXAT" {
+		t.Fatalf("logged %q, want one SET k v PXAT <ms>", cmds)
+	}
+	ms, err := strconv.ParseInt(cmds[0][4], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := before.Add(100 * time.Second).UnixMilli(); ms < want-1000 || ms > want+1000 {
+		t.Errorf("deadline %d is not about 100s after %d", ms, before.UnixMilli())
+	}
+	if got := s.expires["k"]; !got.Equal(time.UnixMilli(ms)) {
+		t.Errorf("deadline in memory %v != deadline in file %v", got, time.UnixMilli(ms))
+	}
+}
+
+// Replay keeps the original deadline instead of restarting the countdown,
+// and a deadline that passed while the server was down leaves the key
+// missing, even if an older value was set before it.
+func TestReplayKeepsDeadlines(t *testing.T) {
+	future := time.Now().Add(time.Hour).UnixMilli()
+	past := time.Now().Add(-time.Minute).UnixMilli()
+	var file []byte
+	for _, c := range [][]string{
+		{"SET", "live", "v", "PXAT", strconv.FormatInt(future, 10)},
+		{"SET", "dead", "old"},
+		{"SET", "dead", "new", "PXAT", strconv.FormatInt(past, 10)},
+	} {
+		file = append(file, encodeCommand(c)...)
+	}
+
+	s := NewStore()
+	if _, err := replay(s, bytes.NewReader(file)); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if got := s.expires["live"]; !got.Equal(time.UnixMilli(future)) {
+		t.Errorf("live expires at %v, want the original %v", got, time.UnixMilli(future))
+	}
+	if v, ok, _ := s.Get("dead"); ok {
+		t.Errorf("dead = %q after replay, want missing", v)
+	}
+}
+
+func TestSetPXAT(t *testing.T) {
+	s := NewStore()
+	var out bytes.Buffer
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"SET", "k", "v", "PXAT", strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)}, "+OK\r\n"},
+		{[]string{"GET", "k"}, "$1\r\nv\r\n"},
+		{[]string{"SET", "k", "v", "PXAT", "1"}, "+OK\r\n"}, // 1970: already passed
+		{[]string{"GET", "k"}, "$-1\r\n"},
+		{[]string{"SET", "k", "v", "PXAT", "0"}, "-ERR invalid expire time in 'set' command\r\n"},
+		{[]string{"SET", "k", "v", "PXAT", "soon"}, "-ERR invalid expire time in 'set' command\r\n"},
+		{[]string{"SET", "k", "v", "PX", "100"}, "-ERR syntax error\r\n"},
+	} {
+		out.Reset()
+		dispatch(s, &out, c.args)
+		if out.String() != c.want {
+			t.Errorf("%q replied %q, want %q", c.args, out.String(), c.want)
+		}
 	}
 }

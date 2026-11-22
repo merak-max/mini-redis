@@ -118,20 +118,13 @@ func dispatch(s *Store, w io.Writer, args []string) error {
 			}
 			_, err = io.WriteString(w, "+OK\r\n")
 
-		case 5:
-			if !strings.EqualFold(args[3], "EX") {
-				_, err = io.WriteString(w, "-ERR syntax error\r\n")
+		case 5: // SET key value EX <seconds> | PXAT <unix-ms>
+			at, errReply := parseExpiry(args[3], args[4], time.Now())
+			if errReply != "" {
+				_, err = io.WriteString(w, errReply)
 				break
 			}
-
-			seconds, convErr := strconv.Atoi(args[4])
-			if convErr != nil || seconds <= 0 || int64(seconds) > maxExpireSeconds {
-				_, err = io.WriteString(w, "-ERR invalid expire time in 'set' command\r\n")
-				break
-			}
-
-			ttl := time.Duration(seconds) * time.Second
-			if setErr := s.SetWithTTL(args[1], args[2], ttl); setErr != nil {
+			if setErr := s.SetAt(args[1], args[2], at); setErr != nil {
 				_, err = io.WriteString(w, "-"+setErr.Error()+"\r\n")
 				break
 			}
@@ -376,6 +369,27 @@ func writeArray(w io.Writer, items []string) error {
 		}
 	}
 	return nil
+}
+
+// parseExpiry turns SET's "EX <seconds>" or "PXAT <unix-ms>" into an
+// absolute deadline. On failure it returns the error reply to send.
+// Clients rarely send PXAT; the AOF uses it for every TTL.
+func parseExpiry(option, value string, now time.Time) (time.Time, string) {
+	n, convErr := strconv.ParseInt(value, 10, 64)
+	invalid := "-ERR invalid expire time in 'set' command\r\n"
+	switch {
+	case strings.EqualFold(option, "EX"):
+		if convErr != nil || n <= 0 || n > maxExpireSeconds {
+			return time.Time{}, invalid
+		}
+		return now.Add(time.Duration(n) * time.Second), ""
+	case strings.EqualFold(option, "PXAT"):
+		if convErr != nil || n <= 0 {
+			return time.Time{}, invalid
+		}
+		return time.UnixMilli(n), ""
+	}
+	return time.Time{}, "-ERR syntax error\r\n"
 }
 
 // parseScore reads a sorted-set score. Redis accepts "inf" and "-inf"
