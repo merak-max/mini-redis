@@ -484,3 +484,36 @@ func TestSetPXAT(t *testing.T) {
 		}
 	}
 }
+
+// The fsync loop keeps running while the file is open, and stops cleanly,
+// with no error, once it is closed.
+func TestSyncEveryStopsOnClose(t *testing.T) {
+	a, err := OpenAOF(filepath.Join(t.TempDir(), "appendonly.aof"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.SyncEvery(time.Millisecond) }()
+
+	for i := 0; i < 20; i++ { // appends while fsyncs run, for the race detector
+		if err := a.Append("SET", "k", strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("SyncEvery returned %v while the file was open", err)
+	default:
+	}
+
+	a.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SyncEvery after Close = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SyncEvery still running a second after Close")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // AOF is an append-only file of write commands, stored in RESP format:
@@ -83,6 +84,36 @@ func (a *AOF) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.f.Close()
+}
+
+// SyncEvery fsyncs the file every interval, like Redis's default
+// "appendfsync everysec". Append only hands bytes to the kernel's page
+// cache, which survives a process crash but not a power loss. fsync makes
+// the kernel write them to the disk, so a power loss loses at most about
+// one interval of acknowledged writes.
+//
+// It doesn't take a.mu. fsync can take milliseconds, and Append runs while
+// holding the store lock, so waiting on a.mu would stall every client.
+// os.File is safe to use from several goroutines, and a write that lands
+// during an fsync is covered by the next one.
+//
+// It returns nil once the file is closed. Any other fsync error is
+// returned, and the caller should stop the server: after a failed fsync
+// it can't know what reached the disk, and Linux may drop the unwritten
+// pages and report success on the next fsync. Restarting replays from
+// what's really in the file.
+func (a *AOF) SyncEvery(interval time.Duration) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := a.f.Sync(); err != nil {
+			if errors.Is(err, os.ErrClosed) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // errTornTail means the AOF ends partway through a command: the process

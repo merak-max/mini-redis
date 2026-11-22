@@ -47,6 +47,11 @@ func main() {
 	}
 	log.Printf("Loaded %d commands from %s", n, aofPath)
 	store.aof = aof
+	go func() {
+		if err := aof.SyncEvery(time.Second); err != nil {
+			log.Fatalf("AOF fsync failed, stopping: %v", err)
+		}
+	}()
 
 	go store.StartCleanup(time.Second)
 
