@@ -312,3 +312,82 @@ func TestStoreAOFFailureChangesNothing(t *testing.T) {
 		t.Errorf("ZCARD z = %d, want 0", n)
 	}
 }
+
+// Writes logged by one store rebuild the same data in a fresh store.
+func TestReplayRestoresState(t *testing.T) {
+	s, _ := newLoggedStore(t)
+	cmds := [][]string{
+		{"SET", "name", "hemant"},
+		{"SET", "name", "max"}, // overwrite: replay keeps the last value
+		{"SET", "gone", "x"},
+		{"DEL", "gone"},
+		{"RPUSH", "jobs", "a", "b", "c"},
+		{"LPOP", "jobs"},
+		{"ZADD", "board", "0.1", "alice", "50", "bob", "-inf", "carol"},
+		{"ZADD", "board", "90", "bob"}, // score update
+		{"ZREM", "board", "carol"},
+	}
+	var out bytes.Buffer
+	for _, c := range cmds {
+		dispatch(s, &out, c)
+	}
+	data, err := os.ReadFile(s.aof.f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fresh := NewStore()
+	n, err := replay(fresh, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if n != len(cmds) {
+		t.Fatalf("replayed %d commands, want %d", n, len(cmds))
+	}
+
+	// Compare what clients would see, byte for byte.
+	for _, q := range [][]string{
+		{"GET", "name"},
+		{"GET", "gone"},
+		{"LRANGE", "jobs", "0", "-1"},
+		{"ZRANGE", "board", "0", "-1", "WITHSCORES"},
+	} {
+		var want, got bytes.Buffer
+		dispatch(s, &want, q)
+		dispatch(fresh, &got, q)
+		if got.String() != want.String() {
+			t.Errorf("%v after replay = %q, want %q", q, got.String(), want.String())
+		}
+	}
+}
+
+func TestReplayEmptyFile(t *testing.T) {
+	n, err := replay(NewStore(), bytes.NewReader(nil))
+	if n != 0 || err != nil {
+		t.Fatalf("replay(empty) = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// A damaged file stops replay instead of loading part of the data.
+func TestReplayRejectsDamagedFile(t *testing.T) {
+	good := encodeCommand([]string{"SET", "k", "v"})
+	cases := map[string][]byte{
+		// The process died halfway through writing the last command.
+		// Milestone 6 will truncate this instead of failing.
+		"torn last command": append(append([]byte{}, good...), "*3\r\n$3\r\nSET\r\n$1\r\nk"...),
+		"garbage":           append(append([]byte{}, good...), "hello\r\n"...),
+		// Each command parses, but the second can't have succeeded originally.
+		"failing command": append(append([]byte{}, good...), encodeCommand([]string{"LPUSH", "k", "x"})...),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			n, err := replay(NewStore(), bytes.NewReader(data))
+			if err == nil {
+				t.Fatal("replay succeeded, want an error")
+			}
+			if n != 1 {
+				t.Errorf("replayed %d commands before the error, want 1", n)
+			}
+		})
+	}
+}

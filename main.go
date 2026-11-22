@@ -14,6 +14,8 @@ import (
 
 const listenAddr = ":6380"
 
+const aofPath = "appendonly.aof"
+
 // maxExpireSeconds is the largest EX value that fits in a time.Duration
 // (int64 nanoseconds), about 292 years. Anything larger would overflow.
 const maxExpireSeconds = int64(math.MaxInt64) / int64(time.Second)
@@ -22,6 +24,21 @@ const maxExpireSeconds = int64(math.MaxInt64) / int64(time.Second)
 var store = NewStore()
 
 func main() {
+	aof, err := OpenAOF(aofPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Rebuild the store from the file before logging is on and before any
+	// client or the cleanup goroutine can touch the store. Nothing else
+	// runs yet, so setting store.aof needs no lock.
+	n, err := replay(store, aof.f)
+	if err != nil {
+		log.Fatalf("AOF replay failed, not starting: %v", err)
+	}
+	log.Printf("Loaded %d commands from %s", n, aofPath)
+	store.aof = aof
+
 	go store.StartCleanup(time.Second)
 
 	listener, err := net.Listen("tcp", listenAddr)

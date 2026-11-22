@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -78,4 +82,33 @@ func (a *AOF) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.f.Close()
+}
+
+// replay runs every command in r against s and returns how many it ran.
+// s must not have an AOF attached, or replay would append each command
+// back onto the file it is reading.
+//
+// Replay stops with an error if a command can't be parsed or gets an error
+// reply. The file only ever holds commands that succeeded, so either case
+// means the file is damaged, and starting with silently missing data is
+// worse than not starting. A torn last command from a crash is an error
+// too for now; milestone 6 truncates it instead.
+func replay(s *Store, r io.Reader) (int, error) {
+	reader := bufio.NewReader(r)
+	var reply bytes.Buffer
+	for n := 0; ; n++ {
+		args, err := readCommand(reader)
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, fmt.Errorf("command %d: %w", n+1, err)
+		}
+
+		reply.Reset()
+		dispatch(s, &reply, args) // writes to a bytes.Buffer never fail
+		if bytes.HasPrefix(reply.Bytes(), []byte("-")) {
+			return n, fmt.Errorf("command %d %q: %s", n+1, args, strings.TrimSpace(reply.String()))
+		}
+	}
 }
