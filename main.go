@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -32,8 +33,16 @@ func main() {
 	// Rebuild the store from the file before logging is on and before any
 	// client or the cleanup goroutine can touch the store. Nothing else
 	// runs yet, so setting store.aof needs no lock.
-	n, err := replay(store, aof.f)
-	if err != nil {
+	n, good, err := replay(store, aof.f)
+	if errors.Is(err, errTornTail) {
+		// Cut the partial command off. Skipping it isn't enough: the next
+		// Append would land right after it, gluing a valid command onto
+		// garbage and turning a torn tail into damage in the middle.
+		if err := aof.f.Truncate(good); err != nil {
+			log.Fatalf("AOF: can't truncate the partial last command: %v", err)
+		}
+		log.Printf("AOF: dropped a partial last command; file truncated to %d bytes", good)
+	} else if err != nil {
 		log.Fatalf("AOF replay failed, not starting: %v", err)
 	}
 	log.Printf("Loaded %d commands from %s", n, aofPath)

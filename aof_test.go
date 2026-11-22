@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -337,12 +338,12 @@ func TestReplayRestoresState(t *testing.T) {
 	}
 
 	fresh := NewStore()
-	n, err := replay(fresh, bytes.NewReader(data))
+	n, good, err := replay(fresh, bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if n != len(cmds) {
-		t.Fatalf("replayed %d commands, want %d", n, len(cmds))
+	if n != len(cmds) || good != int64(len(data)) {
+		t.Fatalf("replay = %d commands, %d good bytes; want %d, %d", n, good, len(cmds), len(data))
 	}
 
 	// Compare what clients would see, byte for byte.
@@ -362,28 +363,46 @@ func TestReplayRestoresState(t *testing.T) {
 }
 
 func TestReplayEmptyFile(t *testing.T) {
-	n, err := replay(NewStore(), bytes.NewReader(nil))
-	if n != 0 || err != nil {
-		t.Fatalf("replay(empty) = %d, %v; want 0, nil", n, err)
+	n, good, err := replay(NewStore(), bytes.NewReader(nil))
+	if n != 0 || good != 0 || err != nil {
+		t.Fatalf("replay(empty) = %d, %d, %v; want 0, 0, nil", n, good, err)
 	}
 }
 
-// A damaged file stops replay instead of loading part of the data.
+// Cutting the last command off at any byte is a torn tail, not damage:
+// replay keeps everything before it and reports where the good part ends.
+func TestReplayTornTailAtEveryByte(t *testing.T) {
+	first := encodeCommand([]string{"SET", "a", "1"})
+	last := encodeCommand([]string{"RPUSH", "l", "x", "y"})
+	for cut := 1; cut < len(last); cut++ {
+		data := append(append([]byte{}, first...), last[:cut]...)
+		s := NewStore()
+		n, good, err := replay(s, bytes.NewReader(data))
+		if !errors.Is(err, errTornTail) {
+			t.Fatalf("cut after %d bytes %q: err = %v, want errTornTail", cut, last[:cut], err)
+		}
+		if n != 1 || good != int64(len(first)) {
+			t.Fatalf("cut after %d bytes: %d commands, good = %d; want 1, %d", cut, n, good, len(first))
+		}
+		if v, ok, _ := s.Get("a"); !ok || v != "1" {
+			t.Fatalf("cut after %d bytes: a = %q, %v; want \"1\"", cut, v, ok)
+		}
+	}
+}
+
+// Damage before the end stops replay: what follows it was acknowledged.
 func TestReplayRejectsDamagedFile(t *testing.T) {
 	good := encodeCommand([]string{"SET", "k", "v"})
 	cases := map[string][]byte{
-		// The process died halfway through writing the last command.
-		// Milestone 6 will truncate this instead of failing.
-		"torn last command": append(append([]byte{}, good...), "*3\r\n$3\r\nSET\r\n$1\r\nk"...),
-		"garbage":           append(append([]byte{}, good...), "hello\r\n"...),
+		"garbage": append(append([]byte{}, good...), "hello\r\n"...),
 		// Each command parses, but the second can't have succeeded originally.
 		"failing command": append(append([]byte{}, good...), encodeCommand([]string{"LPUSH", "k", "x"})...),
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
-			n, err := replay(NewStore(), bytes.NewReader(data))
-			if err == nil {
-				t.Fatal("replay succeeded, want an error")
+			n, _, err := replay(NewStore(), bytes.NewReader(data))
+			if err == nil || errors.Is(err, errTornTail) {
+				t.Fatalf("err = %v, want a damage error", err)
 			}
 			if n != 1 {
 				t.Errorf("replayed %d commands before the error, want 1", n)
@@ -432,7 +451,7 @@ func TestReplayKeepsDeadlines(t *testing.T) {
 	}
 
 	s := NewStore()
-	if _, err := replay(s, bytes.NewReader(file)); err != nil {
+	if _, _, err := replay(s, bytes.NewReader(file)); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if got := s.expires["live"]; !got.Equal(time.UnixMilli(future)) {

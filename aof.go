@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -84,31 +85,62 @@ func (a *AOF) Close() error {
 	return a.f.Close()
 }
 
-// replay runs every command in r against s and returns how many it ran.
+// errTornTail means the AOF ends partway through a command: the process
+// died, or the disk filled, in the middle of an Append. That command was
+// never acknowledged, because the reply comes after Append returns, so it
+// is safe to drop.
+var errTornTail = errors.New("AOF ends with a partial command")
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// replay runs every command in r against s. It returns how many commands
+// it ran and good, the byte offset where the last complete command ends.
 // s must not have an AOF attached, or replay would append each command
 // back onto the file it is reading.
 //
-// Replay stops with an error if a command can't be parsed or gets an error
-// reply. The file only ever holds commands that succeeded, so either case
-// means the file is damaged, and starting with silently missing data is
-// worse than not starting. A torn last command from a crash is an error
-// too for now; milestone 6 truncates it instead.
-func replay(s *Store, r io.Reader) (int, error) {
-	reader := bufio.NewReader(r)
+// replay only reads and reports. The caller owns the file and decides what
+// to do with it, so tests can replay from a bytes.Reader.
+//
+//   - The file ends partway through a command: errTornTail. The caller
+//     should truncate the file to good and start.
+//   - Any other parse error, or a command that gets an error reply: the
+//     file is damaged in the middle. The file only ever holds commands that
+//     succeeded, and dropping what follows would lose acknowledged writes,
+//     so the caller should refuse to start.
+func replay(s *Store, r io.Reader) (n int, good int64, err error) {
+	counter := &countingReader{r: r}
+	reader := bufio.NewReader(counter)
 	var reply bytes.Buffer
-	for n := 0; ; n++ {
+	for ; ; n++ {
 		args, err := readCommand(reader)
 		if err == io.EOF {
-			return n, nil
+			return n, good, nil
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return n, good, errTornTail
 		}
 		if err != nil {
-			return n, fmt.Errorf("command %d: %w", n+1, err)
+			return n, good, fmt.Errorf("command %d at byte %d: %w", n+1, good, err)
 		}
 
 		reply.Reset()
 		dispatch(s, &reply, args) // writes to a bytes.Buffer never fail
 		if bytes.HasPrefix(reply.Bytes(), []byte("-")) {
-			return n, fmt.Errorf("command %d %q: %s", n+1, args, strings.TrimSpace(reply.String()))
+			return n, good, fmt.Errorf("command %d %q at byte %d: %s", n+1, args, good, strings.TrimSpace(reply.String()))
 		}
+
+		// bufio reads ahead, so the bytes consumed so far are the bytes
+		// pulled from r minus the bytes still waiting in the buffer.
+		good = counter.n - int64(reader.Buffered())
 	}
 }
