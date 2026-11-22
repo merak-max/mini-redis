@@ -3,6 +3,8 @@ package main
 import (
 	"container/list"
 	"errors"
+	"fmt"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -34,6 +36,7 @@ type Store struct {
 	mu      sync.RWMutex
 	data    map[string]*Value    // every key; Value.typ says string or list
 	expires map[string]time.Time // only keys that have a TTL
+	aof     *AOF                 // nil: writes aren't logged (replay, most tests)
 }
 
 func NewStore() *Store {
@@ -67,6 +70,24 @@ func (s *Store) isExpired(key string, now time.Time) bool {
 	at, hasTTL := s.expires[key]
 	return hasTTL && !now.Before(at)
 }
+
+// log appends a write command to the AOF, if one is attached.
+//
+// Every write method calls it under s.mu, after validation and before
+// changing memory. Holding the lock keeps the file in the same order as
+// memory. Logging before applying means a failed disk write leaves memory
+// unchanged, so the client never gets OK for a write that wasn't saved.
+// Lazy and active expiry are not logged: replay restores the deadline and
+// expiry deletes the key again.
+func (s *Store) log(args ...string) error {
+	if s.aof == nil {
+		return nil
+	}
+	if err := s.aof.Append(args...); err != nil {
+		return fmt.Errorf("ERR AOF write failed: %w", err)
+	}
+	return nil
+}
 func (s *Store) Push(key string, front bool, values ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -82,6 +103,14 @@ func (s *Store) Push(key string, front bool, values ...string) (int, error) {
 
 	if exists && value.typ != ListType {
 		return 0, errWrongType
+	}
+
+	cmd := "RPUSH"
+	if front {
+		cmd = "LPUSH"
+	}
+	if err := s.log(append([]string{cmd, key}, values...)...); err != nil {
+		return 0, err
 	}
 
 	if !exists {
@@ -154,6 +183,14 @@ func (s *Store) Pop(key string, front bool) (string, bool, error) {
 		return "", false, nil
 	}
 
+	cmd := "RPOP"
+	if front {
+		cmd = "LPOP"
+	}
+	if err := s.log(cmd, key); err != nil {
+		return "", false, err
+	}
+
 	value.list.Remove(elem)
 	if value.list.Len() == 0 {
 		s.deleteKey(key)
@@ -223,26 +260,51 @@ func (s *Store) Get(key string) (string, bool, error) {
 	return value.str, true, nil
 }
 
-func (s *Store) Set(key, value string) {
+func (s *Store) Set(key, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if err := s.log("SET", key, value); err != nil {
+		return err // memory is unchanged
+	}
 	s.setKey(key, value, time.Time{})
+	return nil
 }
 
-func (s *Store) SetWithTTL(key, value string, ttl time.Duration) {
+// SetWithTTL logs the TTL as relative seconds. Known bug, fixed in
+// milestone 5: replay restarts the countdown. Milestone 5 logs an
+// absolute deadline instead.
+func (s *Store) SetWithTTL(key, value string, ttl time.Duration) error {
 	if ttl <= 0 {
-		return
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	seconds := strconv.FormatInt(int64(ttl/time.Second), 10)
+	if err := s.log("SET", key, value, "EX", seconds); err != nil {
+		return err
+	}
 	s.setKey(key, value, time.Now().Add(ttl))
+	return nil
 }
 
-func (s *Store) Del(keys ...string) int {
+func (s *Store) Del(keys ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now()
+
+	// Log only if a live key will actually be deleted.
+	for _, key := range keys {
+		if _, exists := s.data[key]; exists && !s.isExpired(key, now) {
+			if err := s.log(append([]string{"DEL"}, keys...)...); err != nil {
+				return 0, err
+			}
+			break
+		}
+	}
+
 	count := 0
 	for _, key := range keys {
 		if _, exists := s.data[key]; !exists {
@@ -254,7 +316,7 @@ func (s *Store) Del(keys ...string) int {
 		}
 		s.deleteKey(key)
 	}
-	return count
+	return count, nil
 }
 
 // --- active expiry ---

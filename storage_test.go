@@ -83,7 +83,7 @@ func TestStoreBasic(t *testing.T) {
 
 	s.Set("a", "1")
 	// "k" and "a" exist, "nope" does not, "k" is listed twice.
-	if n := s.Del("k", "a", "nope", "k"); n != 2 {
+	if n, _ := s.Del("k", "a", "nope", "k"); n != 2 {
 		t.Fatalf("Del count = %d, want 2", n)
 	}
 	if _, ok, _ := s.Get("k"); ok {
@@ -267,7 +267,7 @@ func TestStoreDelIgnoresExpired(t *testing.T) {
 	s.Set("live", "v")
 	time.Sleep(30 * time.Millisecond)
 
-	if n := s.Del("old", "live"); n != 1 {
+	if n, _ := s.Del("old", "live"); n != 1 {
 		t.Fatalf("Del count = %d, want 1 (only the live key)", n)
 	}
 }

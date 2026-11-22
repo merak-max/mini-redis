@@ -95,7 +95,10 @@ func dispatch(s *Store, w io.Writer, args []string) error {
 	case "SET":
 		switch len(args) {
 		case 3:
-			s.Set(args[1], args[2])
+			if setErr := s.Set(args[1], args[2]); setErr != nil {
+				_, err = io.WriteString(w, "-"+setErr.Error()+"\r\n")
+				break
+			}
 			_, err = io.WriteString(w, "+OK\r\n")
 
 		case 5:
@@ -111,8 +114,10 @@ func dispatch(s *Store, w io.Writer, args []string) error {
 			}
 
 			ttl := time.Duration(seconds) * time.Second
-			s.SetWithTTL(args[1], args[2], ttl)
-
+			if setErr := s.SetWithTTL(args[1], args[2], ttl); setErr != nil {
+				_, err = io.WriteString(w, "-"+setErr.Error()+"\r\n")
+				break
+			}
 			_, err = io.WriteString(w, "+OK\r\n")
 
 		default:
@@ -208,8 +213,12 @@ func dispatch(s *Store, w io.Writer, args []string) error {
 			break
 		}
 
-		count := s.Del(args[1:]...)
-		_, err = fmt.Fprintf(w, ":%d\r\n", count)
+		count, delErr := s.Del(args[1:]...)
+		if delErr != nil {
+			_, err = fmt.Fprintf(w, "-%s\r\n", delErr.Error())
+		} else {
+			_, err = fmt.Fprintf(w, ":%d\r\n", count)
+		}
 
 	case "ZADD": // ZADD key score member [score member ...]
 		if len(args) < 4 {

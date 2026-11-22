@@ -98,6 +98,17 @@ func (s *Store) ZAdd(key string, members []ZMember) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// formatScore uses the shortest form that parses back to the same
+	// float64, so replay restores exactly the same score.
+	logArgs := []string{"ZADD", key}
+	for _, m := range members {
+		logArgs = append(logArgs, formatScore(m.Score), m.Member)
+	}
+	if err := s.log(logArgs...); err != nil {
+		return 0, err
+	}
+
 	if z == nil {
 		z = newZSet()
 		s.data[key] = &Value{typ: ZSetType, zset: z}
@@ -120,6 +131,9 @@ func (s *Store) ZRem(key string, members ...string) (int, error) {
 
 	z, err := s.lookupZSet(key)
 	if err != nil || z == nil {
+		return 0, err
+	}
+	if err := s.log(append([]string{"ZREM", key}, members...)...); err != nil {
 		return 0, err
 	}
 

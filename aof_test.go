@@ -209,3 +209,106 @@ func TestAOFAppendAfterClose(t *testing.T) {
 		t.Fatal("Append after Close should return an error")
 	}
 }
+
+// newLoggedStore returns a store that logs to an AOF in a temp directory,
+// and a function that returns every command in the file so far.
+func newLoggedStore(t *testing.T) (*Store, func() [][]string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	a, err := OpenAOF(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { a.Close() })
+	s := NewStore()
+	s.aof = a
+	logged := func() [][]string {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return readAll(t, data)
+	}
+	return s, logged
+}
+
+// Every successful write is logged, in order. Commands that fail or change
+// nothing (WRONGTYPE, popping a missing key, deleting a missing key) are not.
+func TestStoreLogsWrites(t *testing.T) {
+	s, logged := newLoggedStore(t)
+
+	run := func(args ...string) {
+		t.Helper()
+		var out bytes.Buffer
+		if err := dispatch(s, &out, args); err != nil {
+			t.Fatalf("dispatch %v: %v", args, err)
+		}
+	}
+	run("SET", "name", "hemant")
+	run("SET", "tmp", "v", "EX", "100")
+	run("RPUSH", "jobs", "a", "b")
+	run("LPUSH", "jobs", "z")
+	run("LPOP", "jobs")
+	run("RPOP", "missing")    // no key: not logged
+	run("LPUSH", "name", "x") // WRONGTYPE: not logged
+	run("ZADD", "board", "1.5", "alice", "-inf", "bob")
+	run("ZADD", "board", "abc", "carol") // bad score: not logged
+	run("ZREM", "board", "bob")
+	run("ZREM", "nosuchset", "x") // no key: not logged
+	run("DEL", "nope")            // nothing deleted: not logged
+	run("DEL", "name", "nope")
+	run("GET", "tmp") // reads are never logged
+
+	want := [][]string{
+		{"SET", "name", "hemant"},
+		{"SET", "tmp", "v", "EX", "100"},
+		{"RPUSH", "jobs", "a", "b"},
+		{"LPUSH", "jobs", "z"},
+		{"LPOP", "jobs"},
+		{"ZADD", "board", "1.5", "alice", "-inf", "bob"},
+		{"ZREM", "board", "bob"},
+		{"DEL", "name", "nope"},
+	}
+	if got := logged(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("AOF contents:\n got %q\nwant %q", got, want)
+	}
+}
+
+// If the AOF write fails, the client gets an error and memory is unchanged:
+// the server never says OK for a write it didn't save.
+func TestStoreAOFFailureChangesNothing(t *testing.T) {
+	s, _ := newLoggedStore(t)
+	var out bytes.Buffer
+	dispatch(s, &out, []string{"SET", "k", "old"})
+	dispatch(s, &out, []string{"RPUSH", "l", "a"})
+	s.aof.Close() // every Append now fails
+
+	cases := [][]string{
+		{"SET", "k", "new"},
+		{"SET", "k", "new", "EX", "10"},
+		{"RPUSH", "l", "b"},
+		{"LPOP", "l"},
+		{"DEL", "k"},
+		{"ZADD", "z", "1", "m"},
+	}
+	for _, args := range cases {
+		out.Reset()
+		if err := dispatch(s, &out, args); err != nil {
+			t.Fatalf("dispatch %v: %v", args, err)
+		}
+		if !bytes.HasPrefix(out.Bytes(), []byte("-ERR AOF write failed")) {
+			t.Errorf("%v replied %q, want an AOF error", args, out.String())
+		}
+	}
+
+	if v, ok, _ := s.Get("k"); !ok || v != "old" {
+		t.Errorf("k = %q, %v; want \"old\", true", v, ok)
+	}
+	if items, _ := s.LRange("l", 0, -1); !reflect.DeepEqual(items, []string{"a"}) {
+		t.Errorf("l = %q, want [a]", items)
+	}
+	if n, _ := s.ZCard("z"); n != 0 {
+		t.Errorf("ZCARD z = %d, want 0", n)
+	}
+}
