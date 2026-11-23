@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -28,54 +29,108 @@ type Value struct {
 	zset *zset // used when typ == ZSetType (see zset.go)
 }
 
-// Store keeps values and expiry times in two maps, like real Redis does.
+// Store is split into shards, each with its own lock and its own two maps,
+// so commands on keys in different shards don't wait for each other.
+// A key always lives in the same shard: shardIndex(key).
+type Store struct {
+	shards []shard
+	mask   uint32 // len(shards)-1; len(shards) is a power of 2
+	aof    *AOF   // nil: writes aren't logged (replay, most tests)
+}
+
+// shard keeps values and expiry times in two maps, like real Redis does.
 // Invariant: every key in expires is also in data. A key in data but not
 // in expires never expires. Only setKey and deleteKey change the maps,
 // so the invariant lives in those two places.
-type Store struct {
-	mu      sync.RWMutex
-	data    map[string]*Value    // every key; Value.typ says string or list
+//
+// The padding makes a shard exactly one 128-byte cache line, the unit the
+// CPU moves between cores (Apple M-series; x86 lines are 64 bytes). The
+// fields take 24 bytes, so without it about five shards share a line, and
+// locking one shard steals the line from cores using its neighbours: false
+// sharing. Padding made parallel GET on 16 shards 35% faster.
+// TestShardIsOneCacheLine fails if a new field breaks this.
+type shard struct {
+	mu      sync.Mutex
+	data    map[string]*Value    // every key; Value.typ says the type
 	expires map[string]time.Time // only keys that have a TTL
-	aof     *AOF                 // nil: writes aren't logged (replay, most tests)
+	_       [104]byte            // pad to 128 bytes: see above
 }
+
+// defaultShards is the number of shards the server uses, chosen by
+// BenchmarkShards: on 8 cores, parallel GET takes 147 ns/op with 1 shard
+// and 20 ns/op with 64. 256 is only ~17% faster again, so 64 is enough for
+// a 10-core machine. More shards also cost a little: an active-expiry cycle
+// visits every shard (about 27 us per cycle at 64, 95 us at 256).
+const defaultShards = 64
 
 func NewStore() *Store {
-	return &Store{
-		data:    make(map[string]*Value),
-		expires: make(map[string]time.Time),
-	}
+	return newStoreWithShards(defaultShards)
 }
 
-// --- helpers: caller must hold s.mu ---
+// newStoreWithShards makes a store with n shards. n must be a power of 2,
+// so that hash & (n-1) picks a shard as cheaply as hash % n.
+func newStoreWithShards(n int) *Store {
+	if n <= 0 || n&(n-1) != 0 {
+		panic(fmt.Sprintf("shard count %d is not a power of 2", n))
+	}
+	s := &Store{shards: make([]shard, n), mask: uint32(n - 1)}
+	for i := range s.shards {
+		s.shards[i].data = make(map[string]*Value)
+		s.shards[i].expires = make(map[string]time.Time)
+	}
+	return s
+}
+
+// shardIndex hashes key with 32-bit FNV-1a: for each byte, XOR it into
+// the hash, then multiply by a prime. Cheap, no allocation, and it spreads
+// similar keys ("key:1", "key:2") across shards.
+func (s *Store) shardIndex(key string) int {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return int(h & s.mask)
+}
+
+// shardFor returns a pointer, never a copy: a shard holds a mutex.
+func (s *Store) shardFor(key string) *shard {
+	return &s.shards[s.shardIndex(key)]
+}
+
+// --- helpers: caller must hold sh.mu ---
 
 // setKey stores value. A zero expiresAt means "no TTL", which also clears
 // any TTL the key had before (SET without EX makes a key permanent).
-func (s *Store) setKey(key, value string, expiresAt time.Time) {
-	s.data[key] = &Value{typ: StringType, str: value}
+func (sh *shard) setKey(key, value string, expiresAt time.Time) {
+	sh.data[key] = &Value{typ: StringType, str: value}
 
 	if expiresAt.IsZero() {
-		delete(s.expires, key)
+		delete(sh.expires, key)
 	} else {
-		s.expires[key] = expiresAt
+		sh.expires[key] = expiresAt
 	}
 }
 
-func (s *Store) deleteKey(key string) {
-	delete(s.data, key)
-	delete(s.expires, key)
+func (sh *shard) deleteKey(key string) {
+	delete(sh.data, key)
+	delete(sh.expires, key)
 }
 
 // isExpired is the single expiry rule used by every read and delete path.
-func (s *Store) isExpired(key string, now time.Time) bool {
-	at, hasTTL := s.expires[key]
+func (sh *shard) isExpired(key string, now time.Time) bool {
+	at, hasTTL := sh.expires[key]
 	return hasTTL && !now.Before(at)
 }
 
 // log appends a write command to the AOF, if one is attached.
 //
-// Every write method calls it under s.mu, after validation and before
-// changing memory. Holding the lock keeps the file in the same order as
-// memory. Logging before applying means a failed disk write leaves memory
+// Every write method calls it under the key's shard lock, after
+// validation and before changing memory. Two writes to the same key are
+// in the same shard, so holding its lock keeps them in the file in the
+// same order as in memory. Writes to different keys may reach the file in
+// either order, which is fine: they don't affect each other, so replaying
+// them in either order gives the same result. Logging before applying means a failed disk write leaves memory
 // unchanged, so the client never gets OK for a write that wasn't saved.
 // Lazy and active expiry are not logged: replay restores the deadline and
 // expiry deletes the key again.
@@ -89,17 +144,18 @@ func (s *Store) log(args ...string) error {
 	return nil
 }
 func (s *Store) Push(key string, front bool, values ...string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	now := time.Now()
 
 	// Expired keys behave like missing keys.
-	if s.isExpired(key, now) {
-		s.deleteKey(key)
+	if sh.isExpired(key, now) {
+		sh.deleteKey(key)
 	}
 
-	value, exists := s.data[key]
+	value, exists := sh.data[key]
 
 	if exists && value.typ != ListType {
 		return 0, errWrongType
@@ -118,7 +174,7 @@ func (s *Store) Push(key string, front bool, values ...string) (int, error) {
 			typ:  ListType,
 			list: list.New(),
 		}
-		s.data[key] = value
+		sh.data[key] = value
 	}
 
 	for _, item := range values {
@@ -132,15 +188,16 @@ func (s *Store) Push(key string, front bool, values ...string) (int, error) {
 	return value.list.Len(), nil
 }
 func (s *Store) LLen(key string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	if s.isExpired(key, time.Now()) {
-		s.deleteKey(key)
+	if sh.isExpired(key, time.Now()) {
+		sh.deleteKey(key)
 		return 0, nil
 	}
 
-	value, exists := s.data[key]
+	value, exists := sh.data[key]
 
 	if !exists {
 		return 0, nil
@@ -158,15 +215,16 @@ func (s *Store) LLen(key string) (int, error) {
 // When the last element is removed the key is deleted, as in Redis:
 // Redis never keeps an empty list around.
 func (s *Store) Pop(key string, front bool) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	if s.isExpired(key, time.Now()) {
-		s.deleteKey(key)
+	if sh.isExpired(key, time.Now()) {
+		sh.deleteKey(key)
 		return "", false, nil
 	}
 
-	value, exists := s.data[key]
+	value, exists := sh.data[key]
 	if !exists {
 		return "", false, nil
 	}
@@ -179,7 +237,7 @@ func (s *Store) Pop(key string, front bool) (string, bool, error) {
 		elem = value.list.Front()
 	}
 	if elem == nil { // defensive: lists are deleted when they become empty
-		s.deleteKey(key)
+		sh.deleteKey(key)
 		return "", false, nil
 	}
 
@@ -193,7 +251,7 @@ func (s *Store) Pop(key string, front bool) (string, bool, error) {
 
 	value.list.Remove(elem)
 	if value.list.Len() == 0 {
-		s.deleteKey(key)
+		sh.deleteKey(key)
 	}
 
 	// list.Element stores its value as `any`, so we assert it back to string.
@@ -205,14 +263,15 @@ func (s *Store) Pop(key string, front bool) (string, bool, error) {
 // end). A missing key gives an empty result. container/list has no index
 // lookup, so we walk from the front: O(start + count).
 func (s *Store) LRange(key string, start, stop int) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	if s.isExpired(key, time.Now()) {
-		s.deleteKey(key)
+	if sh.isExpired(key, time.Now()) {
+		sh.deleteKey(key)
 		return nil, nil
 	}
-	value, exists := s.data[key]
+	value, exists := sh.data[key]
 	if !exists {
 		return nil, nil
 	}
@@ -239,17 +298,18 @@ func (s *Store) LRange(key string, start, stop int) ([]string, error) {
 // --- public API ---
 
 func (s *Store) Get(key string) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	value, exists := s.data[key]
+	value, exists := sh.data[key]
 
 	if !exists {
 		return "", false, nil
 	}
 
-	if s.isExpired(key, time.Now()) {
-		s.deleteKey(key)
+	if sh.isExpired(key, time.Now()) {
+		sh.deleteKey(key)
 		return "", false, nil
 	}
 
@@ -261,13 +321,14 @@ func (s *Store) Get(key string) (string, bool, error) {
 }
 
 func (s *Store) Set(key, value string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	if err := s.log("SET", key, value); err != nil {
 		return err // memory is unchanged
 	}
-	s.setKey(key, value, time.Time{})
+	sh.setKey(key, value, time.Time{})
 	return nil
 }
 
@@ -289,29 +350,50 @@ func (s *Store) SetAt(key, value string, at time.Time) error {
 	ms := at.UnixMilli()
 	at = time.UnixMilli(ms)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	if err := s.log("SET", key, value, "PXAT", strconv.FormatInt(ms, 10)); err != nil {
 		return err
 	}
 	if !time.Now().Before(at) {
-		s.deleteKey(key)
+		sh.deleteKey(key)
 		return nil
 	}
-	s.setKey(key, value, at)
+	sh.setKey(key, value, at)
 	return nil
 }
 
+// Del deletes keys that may live in different shards, as one atomic step:
+// it locks every shard involved, then logs and deletes.
+//
+// The shards are locked in increasing index order, each once. Without a
+// fixed order, "DEL a b" and "DEL b a" running together could each lock
+// one shard and wait forever for the other's (deadlock). Each is locked
+// once because sync.Mutex isn't reentrant: locking it twice deadlocks.
 func (s *Store) Del(keys ...string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	idx := make([]int, len(keys))
+	for i, key := range keys {
+		idx[i] = s.shardIndex(key)
+	}
+	slices.Sort(idx)
+	idx = slices.Compact(idx)
+	for _, i := range idx {
+		s.shards[i].mu.Lock()
+	}
+	defer func() {
+		for _, i := range idx {
+			s.shards[i].mu.Unlock()
+		}
+	}()
 
 	now := time.Now()
 
 	// Log only if a live key will actually be deleted.
 	for _, key := range keys {
-		if _, exists := s.data[key]; exists && !s.isExpired(key, now) {
+		sh := s.shardFor(key)
+		if _, exists := sh.data[key]; exists && !sh.isExpired(key, now) {
 			if err := s.log(append([]string{"DEL"}, keys...)...); err != nil {
 				return 0, err
 			}
@@ -321,14 +403,15 @@ func (s *Store) Del(keys ...string) (int, error) {
 
 	count := 0
 	for _, key := range keys {
-		if _, exists := s.data[key]; !exists {
+		sh := s.shardFor(key)
+		if _, exists := sh.data[key]; !exists {
 			continue
 		}
 		// An expired key is already logically gone, so it doesn't count.
-		if !s.isExpired(key, now) {
+		if !sh.isExpired(key, now) {
 			count++
 		}
-		s.deleteKey(key)
+		sh.deleteKey(key)
 	}
 	return count, nil
 }
@@ -340,14 +423,22 @@ const (
 	expireMaxRounds  = 5  // cap on work per cleanup cycle
 )
 
-// removeExpired runs one active-expiry cycle, the same algorithm Redis uses:
-// check a small sample of keys that have a TTL and delete the expired ones.
-// If more than 25% of the sample was expired, there are probably many more,
-// so run another round. Work per cycle is bounded no matter how big the
-// store is.
+// removeExpired runs one active-expiry cycle on every shard.
 func (s *Store) removeExpired() {
+	for i := range s.shards {
+		s.shards[i].removeExpired()
+	}
+}
+
+// removeExpired runs one active-expiry cycle on one shard, the same
+// algorithm Redis uses: check a small sample of keys that have a TTL and
+// delete the expired ones. If more than 25% of the sample was expired,
+// there are probably many more, so run another round. Work per cycle is
+// bounded no matter how big the shard is, and the lock is held for one
+// round of at most expireSampleSize keys at a time.
+func (sh *shard) removeExpired() {
 	for round := 0; round < expireMaxRounds; round++ {
-		s.mu.Lock()
+		sh.mu.Lock()
 		now := time.Now()
 		checked, expired := 0, 0
 
@@ -355,17 +446,17 @@ func (s *Store) removeExpired() {
 		// keys we see form a cheap random sample. We stop after
 		// expireSampleSize keys instead of walking the whole map.
 		// Deleting during range is allowed in Go.
-		for key, at := range s.expires {
+		for key, at := range sh.expires {
 			if checked == expireSampleSize {
 				break
 			}
 			checked++
 			if !now.Before(at) {
-				s.deleteKey(key)
+				sh.deleteKey(key)
 				expired++
 			}
 		}
-		s.mu.Unlock() // let clients run between rounds
+		sh.mu.Unlock() // let clients run between rounds
 
 		if checked == 0 || expired*4 <= checked { // 25% or fewer expired
 			return

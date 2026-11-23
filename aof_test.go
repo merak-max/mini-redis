@@ -430,7 +430,7 @@ func TestSetEXLogsAbsoluteDeadline(t *testing.T) {
 	if want := before.Add(100 * time.Second).UnixMilli(); ms < want-1000 || ms > want+1000 {
 		t.Errorf("deadline %d is not about 100s after %d", ms, before.UnixMilli())
 	}
-	if got := s.expires["k"]; !got.Equal(time.UnixMilli(ms)) {
+	if got, _ := s.deadline("k"); !got.Equal(time.UnixMilli(ms)) {
 		t.Errorf("deadline in memory %v != deadline in file %v", got, time.UnixMilli(ms))
 	}
 }
@@ -454,7 +454,7 @@ func TestReplayKeepsDeadlines(t *testing.T) {
 	if _, _, err := replay(s, bytes.NewReader(file)); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if got := s.expires["live"]; !got.Equal(time.UnixMilli(future)) {
+	if got, _ := s.deadline("live"); !got.Equal(time.UnixMilli(future)) {
 		t.Errorf("live expires at %v, want the original %v", got, time.UnixMilli(future))
 	}
 	if v, ok, _ := s.Get("dead"); ok {

@@ -146,7 +146,41 @@ func BenchmarkActiveExpiryCycle(b *testing.B) {
 	for b.Loop() {
 		s.removeExpired()
 	}
-	if len(s.data) != 1_000_000 {
-		b.Fatalf("%d keys left, want 1000000: nothing should have expired", len(s.data))
+	if keys, _ := s.sizes(); keys != 1_000_000 {
+		b.Fatalf("%d keys left, want 1000000: nothing should have expired", keys)
+	}
+}
+
+// Parallel GET and SET with different shard counts, to choose
+// defaultShards. Compare with -cpu 1,8: with 1 shard this is the old
+// single-lock store.
+func BenchmarkShards(b *testing.B) {
+	keys := benchKeys(100_000)
+	for _, n := range []int{1, 4, 16, 64, 256} {
+		s := newStoreWithShards(n)
+		for _, k := range keys {
+			s.Set(k, "value")
+		}
+		b.Run(fmt.Sprintf("get/shards=%d", n), func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				i := rand.Intn(len(keys))
+				for pb.Next() {
+					if _, ok, _ := s.Get(keys[i%len(keys)]); !ok {
+						b.Error("key missing")
+						return
+					}
+					i++
+				}
+			})
+		})
+		b.Run(fmt.Sprintf("set/shards=%d", n), func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				i := rand.Intn(len(keys))
+				for pb.Next() {
+					s.Set(keys[i%len(keys)], "value")
+					i++
+				}
+			})
+		})
 	}
 }

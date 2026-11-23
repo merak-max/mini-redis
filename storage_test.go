@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestStoreStringType(t *testing.T) {
@@ -13,9 +14,7 @@ func TestStoreStringType(t *testing.T) {
 
 	s.Set("name", "Hemant")
 
-	s.mu.RLock()
-	value := s.data["name"]
-	s.mu.RUnlock()
+	value := s.raw("name")
 
 	if value == nil {
 		t.Fatal("Expected key to exist")
@@ -33,18 +32,11 @@ func TestStoreStringType(t *testing.T) {
 func TestSetReplacesExistingType(t *testing.T) {
 	s := NewStore()
 
-	s.mu.Lock()
-	s.data["key"] = &Value{
-		typ:  ListType,
-		list: listOf("Go", "Redis"),
-	}
-	s.mu.Unlock()
+	s.put("key", &Value{typ: ListType, list: listOf("Go", "Redis")})
 
 	s.Set("key", "Hello")
 
-	s.mu.RLock()
-	value := s.data["key"]
-	s.mu.RUnlock()
+	value := s.raw("key")
 
 	if value.typ != StringType {
 		t.Fatal("SET should replace existing value with StringType")
@@ -57,12 +49,7 @@ func TestSetReplacesExistingType(t *testing.T) {
 func TestGetWrongType(t *testing.T) {
 	s := NewStore()
 
-	s.mu.Lock()
-	s.data["languages"] = &Value{
-		typ:  ListType,
-		list: listOf("Go", "Redis"),
-	}
-	s.mu.Unlock()
+	s.put("languages", &Value{typ: ListType, list: listOf("Go", "Redis")})
 
 	if _, ok, _ := s.Get("languages"); ok {
 		t.Fatal("GET should not return a list as a string")
@@ -123,9 +110,7 @@ func TestSampledExpirationAllExpired(t *testing.T) {
 	s.removeExpired()
 
 	// 4. Check remaining keys
-	s.mu.RLock()
-	remaining := len(s.data)
-	s.mu.RUnlock()
+	remaining, _ := s.sizes()
 
 	if remaining != 0 {
 		t.Fatalf("Expected 0 keys, got %d", remaining)
@@ -141,9 +126,7 @@ func TestSampledExpirationNoneExpired(t *testing.T) {
 
 	s.removeExpired()
 
-	s.mu.RLock()
-	remaining := len(s.data)
-	s.mu.RUnlock()
+	remaining, _ := s.sizes()
 
 	if remaining != 20 {
 		t.Fatalf("Expected 20 keys, got %d", remaining)
@@ -165,17 +148,14 @@ func TestSampledExpirationMixedKeys(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	s.removeExpired()
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	for i := 0; i < 10; i++ {
-		if _, exists := s.data[fmt.Sprintf("live%d", i)]; !exists {
+		if s.raw(fmt.Sprintf("live%d", i)) == nil {
 			t.Fatalf("Live key live%d was incorrectly deleted", i)
 		}
 	}
 
 	for i := 0; i < 10; i++ {
-		if _, exists := s.data[fmt.Sprintf("expired%d", i)]; exists {
+		if s.raw(fmt.Sprintf("expired%d", i)) != nil {
 			t.Fatalf("Expired key expired%d was not deleted", i)
 		}
 	}
@@ -190,11 +170,7 @@ func TestActiveExpiration(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	s.mu.RLock()
-	_, exists := s.data["name"]
-	s.mu.RUnlock()
-
-	if exists {
+	if s.raw("name") != nil {
 		t.Fatal("Expected active cleanup to delete expired key")
 	}
 }
@@ -210,17 +186,15 @@ func TestSetClearsTTL(t *testing.T) {
 	if v, ok, _ := s.Get("k"); !ok || v != "new" {
 		t.Fatalf("Get(k) = %q, %v; want \"new\", true (TTL should be cleared)", v, ok)
 	}
-	s.mu.RLock()
-	_, hasTTL := s.expires["k"]
-	s.mu.RUnlock()
-	if hasTTL {
+	if _, hasTTL := s.deadline("k"); hasTTL {
 		t.Fatal("k still listed in expires after plain SET")
 	}
 }
 
-// One cleanup cycle must do bounded work, however many keys are expired.
+// One cleanup cycle must do bounded work per shard, however many keys are
+// expired. One shard, so the whole bound applies to these 1000 keys.
 func TestActiveExpiryBoundedWork(t *testing.T) {
-	s := NewStore()
+	s := newStoreWithShards(1)
 	for i := 0; i < 1000; i++ {
 		s.SetWithTTL(fmt.Sprintf("k%d", i), "v", time.Millisecond)
 	}
@@ -228,15 +202,10 @@ func TestActiveExpiryBoundedWork(t *testing.T) {
 
 	// Count from what is stored now: with a 1ms TTL, a slow run can expire
 	// a key before SetAt stores it, and SetAt deletes it right away.
-	s.mu.RLock()
-	before := len(s.data)
-	s.mu.RUnlock()
-
+	before, _ := s.sizes()
 	s.removeExpired()
-
-	s.mu.RLock()
-	removed := before - len(s.data)
-	s.mu.RUnlock()
+	after, _ := s.sizes()
+	removed := before - after
 	if max := expireSampleSize * expireMaxRounds; removed == 0 || removed > max {
 		t.Fatalf("one cycle removed %d keys, want between 1 and %d", removed, max)
 	}
@@ -258,10 +227,8 @@ func TestActiveExpiryFindsFewAmongMany(t *testing.T) {
 		s.removeExpired()
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.data) != 10000 || len(s.expires) != 0 {
-		t.Fatalf("after cleanup: %d keys, %d with TTL; want 10000 and 0", len(s.data), len(s.expires))
+	if keys, withTTL := s.sizes(); keys != 10000 || withTTL != 0 {
+		t.Fatalf("after cleanup: %d keys, %d with TTL; want 10000 and 0", keys, withTTL)
 	}
 }
 
@@ -325,4 +292,130 @@ func listOf(items ...string) *list.List {
 		l.PushBack(it)
 	}
 	return l
+}
+
+// --- test helpers: read and write a store's internals under the shard lock ---
+
+// raw returns the stored value for key without any expiry check, or nil.
+func (s *Store) raw(key string) *Value {
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.data[key]
+}
+
+// put stores v at key directly, for setting up types the API can't make.
+func (s *Store) put(key string, v *Value) {
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.data[key] = v
+}
+
+// deadline returns key's expiry time, if it has one.
+func (s *Store) deadline(key string) (time.Time, bool) {
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	at, ok := sh.expires[key]
+	return at, ok
+}
+
+// sizes counts all keys, and the keys with a TTL, across every shard.
+func (s *Store) sizes() (keys, withTTL int) {
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		keys += len(sh.data)
+		withTTL += len(sh.expires)
+		sh.mu.Unlock()
+	}
+	return keys, withTTL
+}
+
+// --- sharding ---
+
+// Keys must spread evenly, or one shard becomes the new global lock.
+func TestShardsSpreadKeys(t *testing.T) {
+	s := NewStore()
+	counts := make([]int, len(s.shards))
+	const n = 16000
+	for i := 0; i < n; i++ {
+		counts[s.shardIndex(fmt.Sprintf("user:%d", i))]++
+	}
+	want := n / len(s.shards)
+	for i, c := range counts {
+		if c < want*8/10 || c > want*12/10 {
+			t.Errorf("shard %d has %d keys, want about %d", i, c, want)
+		}
+	}
+}
+
+// DEL over keys in different shards, from many goroutines in opposite key
+// orders. Locking shards in key order instead of index order deadlocks here.
+func TestDelAcrossShardsNoDeadlock(t *testing.T) {
+	s := NewStore()
+	a, b := "a", "b"
+	for i := 0; s.shardIndex(a) == s.shardIndex(b); i++ {
+		b = fmt.Sprintf("b%d", i) // make sure the two keys are in different shards
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 2000; i++ {
+				s.Set(a, "1")
+				s.Set(b, "1")
+				if g%2 == 0 {
+					s.Del(a, b)
+				} else {
+					s.Del(b, a)
+				}
+			}
+		}(g)
+	}
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("DEL deadlocked: goroutines still running after 10s")
+	}
+}
+
+// The same key twice, or two keys in one shard, must lock that shard once:
+// sync.Mutex isn't reentrant, so locking it twice deadlocks.
+func TestDelSameShardTwice(t *testing.T) {
+	s := NewStore()
+	a, b := "a", "b"
+	for i := 0; s.shardIndex(a) != s.shardIndex(b); i++ {
+		b = fmt.Sprintf("b%d", i) // find a second key in a's shard
+	}
+	s.Set(a, "1")
+	s.Set(b, "1")
+
+	done := make(chan int, 1)
+	go func() {
+		n, _ := s.Del(a, a, b)
+		done <- n
+	}()
+	select {
+	case n := <-done:
+		if n != 2 {
+			t.Fatalf("Del(a, a, b) = %d, want 2", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DEL deadlocked on keys in the same shard")
+	}
+}
+
+// A shard must fill whole cache lines, or neighbouring shards' locks share
+// a line and slow each other down (false sharing). See the shard type.
+func TestShardIsOneCacheLine(t *testing.T) {
+	if size := unsafe.Sizeof(shard{}); size != 128 {
+		t.Fatalf("shard is %d bytes, want 128: adjust the padding", size)
+	}
 }

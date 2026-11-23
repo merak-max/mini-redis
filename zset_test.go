@@ -148,9 +148,7 @@ func TestZSetConcurrentAdd(t *testing.T) {
 	c := newConn(t)
 	c.expect(fmt.Sprintf(":%d\r\n", clients*each), "ZCARD", k)
 
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	z := store.data[k].zset
+	z := store.raw(k).zset // all writers are done, so reading z unlocked is safe
 	want := make([]pair, 0, len(z.scores))
 	for m, s := range z.scores {
 		want = append(want, pair{s, m})
