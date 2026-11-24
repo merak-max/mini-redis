@@ -79,29 +79,6 @@ func TestNetworkDisconnect(t *testing.T) {
 	}
 }
 
-func TestNetworkPartition(t *testing.T) {
-	n, _ := threeNodes()
-	n.partition([]int{0, 1}, []int{2})
-
-	cases := []struct {
-		from, to int
-		want     bool
-	}{
-		{0, 1, true}, {1, 0, true}, // same side
-		{0, 2, false}, {2, 0, false}, {1, 2, false}, // across the cut
-	}
-	for _, c := range cases {
-		if _, ok := n.endpoint(c.from).RequestVote(c.to, RequestVoteArgs{}); ok != c.want {
-			t.Errorf("%d -> %d: ok=%v, want %v", c.from, c.to, ok, c.want)
-		}
-	}
-
-	n.heal()
-	if _, ok := n.endpoint(0).RequestVote(2, RequestVoteArgs{}); !ok {
-		t.Fatal("0 -> 2 still cut off after heal")
-	}
-}
-
 // The receiver must get its own copy of Entries, as over a real network.
 func TestNetworkCopiesEntries(t *testing.T) {
 	n, hs := threeNodes()
@@ -143,8 +120,5 @@ func TestNetworkUnreliable(t *testing.T) {
 	// wide so the test doesn't fail by bad luck.
 	if replies < total/2 || replies == total {
 		t.Fatalf("%d of %d replies arrived, want some lost but most delivered", replies, total)
-	}
-	if got := n.rpcCount(); got != total {
-		t.Fatalf("rpcCount = %d, want %d", got, total)
 	}
 }

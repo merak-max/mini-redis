@@ -12,8 +12,8 @@ import (
 // Raft must survive:
 //
 //   - disconnect: a node sends and receives nothing (crashed, or its
-//     cable is pulled), while its goroutines keep running.
-//   - partition: nodes can only talk to nodes in the same group.
+//     cable is pulled), while its goroutines keep running. With 3 nodes,
+//     disconnecting one is also how we cut the cluster into 2 + 1.
 //   - unreliable: random delays, and random loss of requests and replies.
 //
 // A message can be lost before the receiver runs (it never happens) or
@@ -22,26 +22,22 @@ type network struct {
 	mu         sync.Mutex
 	handlers   map[int]Handler
 	connected  map[int]bool
-	group      map[int]int // partition group; all 0 means no partition
 	unreliable bool
-	rpcs       int // RPCs attempted, for tests that check traffic
 }
 
 func newNetwork() *network {
 	return &network{
 		handlers:  map[int]Handler{},
 		connected: map[int]bool{},
-		group:     map[int]int{},
 	}
 }
 
-// add registers node id, connected and in group 0.
+// add registers node id as connected.
 func (n *network) add(id int, h Handler) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.handlers[id] = h
 	n.connected[id] = true
-	n.group[id] = 0
 }
 
 // endpoint returns the Transport that node id uses to send.
@@ -58,41 +54,16 @@ func (n *network) setConnected(id int, up bool) {
 	n.connected[id] = up
 }
 
-// partition splits the nodes into groups that can't reach each other.
-// partition([]int{0, 1}, []int{2}) cuts node 2 off from 0 and 1. Nodes not
-// listed go into group 0 with the first list.
-func (n *network) partition(groups ...[]int) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for id := range n.group {
-		n.group[id] = 0
-	}
-	for g, ids := range groups {
-		for _, id := range ids {
-			n.group[id] = g
-		}
-	}
-}
-
-// heal removes any partition. Disconnected nodes stay disconnected.
-func (n *network) heal() { n.partition() }
-
 func (n *network) setUnreliable(on bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.unreliable = on
 }
 
-func (n *network) rpcCount() int {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.rpcs
-}
-
 // canTalk reports whether a message can go from one node to another.
 // Caller must hold n.mu.
 func (n *network) canTalk(from, to int) bool {
-	return n.connected[from] && n.connected[to] && n.group[from] == n.group[to]
+	return n.connected[from] && n.connected[to]
 }
 
 // deliver runs rpc against the receiver's handler if the network lets the
@@ -101,7 +72,6 @@ func (n *network) canTalk(from, to int) bool {
 // node's lock, and may be slow.
 func (n *network) deliver(from, to int, rpc func(h Handler)) bool {
 	n.mu.Lock()
-	n.rpcs++
 	h, exists := n.handlers[to]
 	reachable := exists && n.canTalk(from, to)
 	unreliable := n.unreliable
