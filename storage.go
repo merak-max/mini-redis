@@ -254,11 +254,6 @@ func (s *Store) Set(key, value string) error {
 	return nil
 }
 
-// SetWithTTL stores value with a TTL counted from now.
-func (s *Store) SetWithTTL(key, value string, ttl time.Duration) error {
-	return s.SetAt(key, value, time.Now().Add(ttl))
-}
-
 // SetAt stores value with an absolute deadline, and is the only way a key
 // gets a TTL. The AOF records the deadline (SET key value PXAT <unix-ms>),
 // not the duration, so replay restores the same expiry time however long

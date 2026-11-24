@@ -9,9 +9,8 @@ import (
 )
 
 const (
-	maxArrayLen    = 1024
-	maxBulkLen     = 1 << 20 // 1 MB
-	maxRESPLineLen = 64      // longest valid header is 22 bytes
+	maxArrayLen = 1024
+	maxBulkLen  = 1 << 20 // 1 MB
 )
 
 func readCommand(reader *bufio.Reader) ([]string, error) {
@@ -95,17 +94,14 @@ func readCommand(reader *bufio.Reader) ([]string, error) {
 // Reads one RESP header line and returns it without the trailing CRLF.
 func readRESPLine(reader *bufio.Reader) (string, error) {
 	// ReadSlice never grows past the reader's buffer (4096 bytes by default),
-	// so a client cannot make us buffer an endless header.
+	// so a client cannot make us buffer an endless header. A long header
+	// that does fit is still rejected by parseLength.
 	line, err := reader.ReadSlice('\n')
 	if err != nil {
 		if err == bufio.ErrBufferFull {
 			return "", fmt.Errorf("RESP header too long")
 		}
 		return "", incompleteError(err)
-	}
-
-	if len(line) > maxRESPLineLen {
-		return "", fmt.Errorf("RESP header too long")
 	}
 
 	// Copy out of the reader's buffer before the next read overwrites it.

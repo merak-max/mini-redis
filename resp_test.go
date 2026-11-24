@@ -109,8 +109,8 @@ func TestReadCommandMalformed(t *testing.T) {
 		{"truncated in header", "*2\r\n$3\r\nGE"},
 		{"truncated before second element", "*2\r\n$3\r\nGET\r\n"},
 		{"truncated in data", "*1\r\n$4\r\nPI"},
-		{"header longer than limit", "*" + strings.Repeat("1", 100) + "\r\n"},
-		{"header with no newline", "*" + strings.Repeat("1", 10000)},
+		{"header number too large", "*" + strings.Repeat("1", 100) + "\r\n"},
+		{"header longer than the 4 KB buffer", "*" + strings.Repeat("1", 10000)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

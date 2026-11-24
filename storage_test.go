@@ -294,6 +294,12 @@ func listOf(items ...string) *list.List {
 
 // --- test helpers: read and write a store's internals under the lock ---
 
+// SetWithTTL stores value with a TTL counted from now. The server itself
+// always goes through SetAt (dispatch turns EX into a deadline first).
+func (s *Store) SetWithTTL(key, value string, ttl time.Duration) error {
+	return s.SetAt(key, value, time.Now().Add(ttl))
+}
+
 // raw returns the stored value for key without any expiry check, or nil.
 func (s *Store) raw(key string) *Value {
 	s.mu.RLock()
