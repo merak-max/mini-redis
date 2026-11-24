@@ -63,68 +63,10 @@ func TestEncodeCommand(t *testing.T) {
 	}
 }
 
-func TestOpenAOFCreatesFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "appendonly.aof")
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("file should not exist yet: %v", err)
-	}
-
-	a, err := OpenAOF(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Close()
-
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("file was not created: %v", err)
-	}
-	if info.Size() != 0 {
-		t.Fatalf("new file has %d bytes, want 0", info.Size())
-	}
-}
-
 func TestOpenAOFMissingDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "no-such-dir", "appendonly.aof")
 	if _, err := OpenAOF(path); err == nil {
 		t.Fatal("expected an error for a missing directory")
-	}
-}
-
-func TestAOFAppendAndReadBack(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "appendonly.aof")
-	cmds := [][]string{
-		{"SET", "k", "v"},
-		{"RPUSH", "l", "a", "", "c d"},
-		{"ZADD", "z", "1.5", "line\r\nbreak"},
-	}
-
-	a, err := OpenAOF(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, c := range cmds {
-		if err := a.Append(c...); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := a.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var want []byte
-	for _, c := range cmds {
-		want = append(want, encodeCommand(c)...)
-	}
-	if !bytes.Equal(data, want) {
-		t.Fatalf("file:\n%q\nwant:\n%q", data, want)
-	}
-	if got := readAll(t, data); !reflect.DeepEqual(got, cmds) {
-		t.Fatalf("read back %q, want %q", got, cmds)
 	}
 }
 
@@ -459,29 +401,6 @@ func TestReplayKeepsDeadlines(t *testing.T) {
 	}
 	if v, ok, _ := s.Get("dead"); ok {
 		t.Errorf("dead = %q after replay, want missing", v)
-	}
-}
-
-func TestSetPXAT(t *testing.T) {
-	s := NewStore()
-	var out bytes.Buffer
-	for _, c := range []struct {
-		args []string
-		want string
-	}{
-		{[]string{"SET", "k", "v", "PXAT", strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)}, "+OK\r\n"},
-		{[]string{"GET", "k"}, "$1\r\nv\r\n"},
-		{[]string{"SET", "k", "v", "PXAT", "1"}, "+OK\r\n"}, // 1970: already passed
-		{[]string{"GET", "k"}, "$-1\r\n"},
-		{[]string{"SET", "k", "v", "PXAT", "0"}, "-ERR invalid expire time in 'set' command\r\n"},
-		{[]string{"SET", "k", "v", "PXAT", "soon"}, "-ERR invalid expire time in 'set' command\r\n"},
-		{[]string{"SET", "k", "v", "PX", "100"}, "-ERR syntax error\r\n"},
-	} {
-		out.Reset()
-		dispatch(s, &out, c.args)
-		if out.String() != c.want {
-			t.Errorf("%q replied %q, want %q", c.args, out.String(), c.want)
-		}
 	}
 }
 

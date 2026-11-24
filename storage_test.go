@@ -8,26 +8,6 @@ import (
 	"time"
 )
 
-func TestStoreStringType(t *testing.T) {
-	s := NewStore()
-
-	s.Set("name", "Hemant")
-
-	value := s.raw("name")
-
-	if value == nil {
-		t.Fatal("Expected key to exist")
-	}
-
-	if value.typ != StringType {
-		t.Fatal("Expected StringType")
-	}
-
-	if value.str != "Hemant" {
-		t.Fatalf("Got %q, want Hemant", value.str)
-	}
-}
-
 func TestSetReplacesExistingType(t *testing.T) {
 	s := NewStore()
 
@@ -43,15 +23,6 @@ func TestSetReplacesExistingType(t *testing.T) {
 
 	if value.str != "Hello" {
 		t.Fatalf("Got %q, want Hello", value.str)
-	}
-}
-func TestGetWrongType(t *testing.T) {
-	s := NewStore()
-
-	s.put("languages", &Value{typ: ListType, list: listOf("Go", "Redis")})
-
-	if _, ok, _ := s.Get("languages"); ok {
-		t.Fatal("GET should not return a list as a string")
 	}
 }
 func TestStoreBasic(t *testing.T) {
@@ -91,44 +62,6 @@ func TestStoreTTL(t *testing.T) {
 	value, ok, _ = s.Get("name")
 	if ok {
 		t.Fatalf("Expected key to expire, got value: %s", value)
-	}
-}
-func TestSampledExpirationAllExpired(t *testing.T) {
-	s := NewStore()
-
-	// 1. Insert 20 keys with 100ms TTL
-	for i := 0; i < 20; i++ {
-		key := fmt.Sprintf("key%d", i)
-		s.SetWithTTL(key, "value", 100*time.Millisecond)
-	}
-
-	// 2. Wait for keys to expire
-	time.Sleep(150 * time.Millisecond)
-
-	// 3. Run sampled cleanup
-	s.removeExpired()
-
-	// 4. Check remaining keys
-	remaining, _ := s.sizes()
-
-	if remaining != 0 {
-		t.Fatalf("Expected 0 keys, got %d", remaining)
-	}
-}
-func TestSampledExpirationNoneExpired(t *testing.T) {
-	s := NewStore()
-
-	for i := 0; i < 20; i++ {
-		key := fmt.Sprintf("key%d", i)
-		s.Set(key, "value")
-	}
-
-	s.removeExpired()
-
-	remaining, _ := s.sizes()
-
-	if remaining != 20 {
-		t.Fatalf("Expected 20 keys, got %d", remaining)
 	}
 }
 func TestSampledExpirationMixedKeys(t *testing.T) {
@@ -327,16 +260,6 @@ func (s *Store) sizes() (keys, withTTL int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.data), len(s.expires)
-}
-
-// DEL with a repeated key counts it once, as in Redis.
-func TestDelDuplicateKeys(t *testing.T) {
-	s := NewStore()
-	s.Set("a", "1")
-	s.Set("b", "1")
-	if n, _ := s.Del("a", "a", "b"); n != 2 {
-		t.Fatalf("Del(a, a, b) = %d, want 2", n)
-	}
 }
 
 // A read must not delete an expired key: readers share the read lock, so

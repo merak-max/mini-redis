@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"errors"
+	"strconv"
 	"testing"
+	"time"
 )
 
 // run sends one command to dispatch and returns the reply bytes.
@@ -72,6 +74,31 @@ func TestDispatchReturnsWriteError(t *testing.T) {
 	} {
 		if err := dispatch(s, failWriter{}, args); !errors.Is(err, errClosed) {
 			t.Fatalf("%q: got %v, want the write error", args, err)
+		}
+	}
+}
+
+// SET ... PXAT takes an absolute Unix-ms deadline (the AOF logs every TTL
+// this way). A past deadline deletes the key; a bad value is an error.
+func TestSetPXAT(t *testing.T) {
+	s := NewStore()
+	var out bytes.Buffer
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"SET", "k", "v", "PXAT", strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)}, "+OK\r\n"},
+		{[]string{"GET", "k"}, "$1\r\nv\r\n"},
+		{[]string{"SET", "k", "v", "PXAT", "1"}, "+OK\r\n"}, // 1970: already passed
+		{[]string{"GET", "k"}, "$-1\r\n"},
+		{[]string{"SET", "k", "v", "PXAT", "0"}, "-ERR invalid expire time in 'set' command\r\n"},
+		{[]string{"SET", "k", "v", "PXAT", "soon"}, "-ERR invalid expire time in 'set' command\r\n"},
+		{[]string{"SET", "k", "v", "PX", "100"}, "-ERR syntax error\r\n"},
+	} {
+		out.Reset()
+		dispatch(s, &out, c.args)
+		if out.String() != c.want {
+			t.Errorf("%q replied %q, want %q", c.args, out.String(), c.want)
 		}
 	}
 }
