@@ -6,7 +6,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unsafe"
 )
 
 func TestStoreStringType(t *testing.T) {
@@ -191,10 +190,9 @@ func TestSetClearsTTL(t *testing.T) {
 	}
 }
 
-// One cleanup cycle must do bounded work per shard, however many keys are
-// expired. One shard, so the whole bound applies to these 1000 keys.
+// One cleanup cycle must do bounded work, however many keys are expired.
 func TestActiveExpiryBoundedWork(t *testing.T) {
-	s := newStoreWithShards(1)
+	s := NewStore()
 	for i := 0; i < 1000; i++ {
 		s.SetWithTTL(fmt.Sprintf("k%d", i), "v", time.Millisecond)
 	}
@@ -294,128 +292,63 @@ func listOf(items ...string) *list.List {
 	return l
 }
 
-// --- test helpers: read and write a store's internals under the shard lock ---
+// --- test helpers: read and write a store's internals under the lock ---
 
 // raw returns the stored value for key without any expiry check, or nil.
 func (s *Store) raw(key string) *Value {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	return sh.data[key]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data[key]
 }
 
 // put stores v at key directly, for setting up types the API can't make.
 func (s *Store) put(key string, v *Value) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	sh.data[key] = v
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[key] = v
 }
 
 // deadline returns key's expiry time, if it has one.
 func (s *Store) deadline(key string) (time.Time, bool) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	at, ok := sh.expires[key]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	at, ok := s.expires[key]
 	return at, ok
 }
 
-// sizes counts all keys, and the keys with a TTL, across every shard.
+// sizes counts all keys, and the keys with a TTL.
 func (s *Store) sizes() (keys, withTTL int) {
-	for i := range s.shards {
-		sh := &s.shards[i]
-		sh.mu.Lock()
-		keys += len(sh.data)
-		withTTL += len(sh.expires)
-		sh.mu.Unlock()
-	}
-	return keys, withTTL
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.data), len(s.expires)
 }
 
-// --- sharding ---
-
-// Keys must spread evenly, or one shard becomes the new global lock.
-func TestShardsSpreadKeys(t *testing.T) {
+// DEL with a repeated key counts it once, as in Redis.
+func TestDelDuplicateKeys(t *testing.T) {
 	s := NewStore()
-	counts := make([]int, len(s.shards))
-	const n = 16000
-	for i := 0; i < n; i++ {
-		counts[s.shardIndex(fmt.Sprintf("user:%d", i))]++
-	}
-	want := n / len(s.shards)
-	for i, c := range counts {
-		if c < want*8/10 || c > want*12/10 {
-			t.Errorf("shard %d has %d keys, want about %d", i, c, want)
-		}
+	s.Set("a", "1")
+	s.Set("b", "1")
+	if n, _ := s.Del("a", "a", "b"); n != 2 {
+		t.Fatalf("Del(a, a, b) = %d, want 2", n)
 	}
 }
 
-// DEL over keys in different shards, from many goroutines in opposite key
-// orders. Locking shards in key order instead of index order deadlocks here.
-func TestDelAcrossShardsNoDeadlock(t *testing.T) {
+// A read must not delete an expired key: readers share the read lock, so
+// a write from one of them would race with the others. Active expiry
+// removes it instead.
+func TestReadLeavesExpiredKey(t *testing.T) {
 	s := NewStore()
-	a, b := "a", "b"
-	for i := 0; s.shardIndex(a) == s.shardIndex(b); i++ {
-		b = fmt.Sprintf("b%d", i) // make sure the two keys are in different shards
-	}
+	s.SetWithTTL("k", "v", time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
 
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func(g int) {
-			defer wg.Done()
-			for i := 0; i < 2000; i++ {
-				s.Set(a, "1")
-				s.Set(b, "1")
-				if g%2 == 0 {
-					s.Del(a, b)
-				} else {
-					s.Del(b, a)
-				}
-			}
-		}(g)
+	if _, ok, _ := s.Get("k"); ok {
+		t.Fatal("GET returned an expired key")
 	}
-	go func() { wg.Wait(); close(done) }()
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("DEL deadlocked: goroutines still running after 10s")
+	if s.raw("k") == nil {
+		t.Fatal("GET deleted the key; reads must not change the maps")
 	}
-}
-
-// The same key twice, or two keys in one shard, must lock that shard once:
-// sync.Mutex isn't reentrant, so locking it twice deadlocks.
-func TestDelSameShardTwice(t *testing.T) {
-	s := NewStore()
-	a, b := "a", "b"
-	for i := 0; s.shardIndex(a) != s.shardIndex(b); i++ {
-		b = fmt.Sprintf("b%d", i) // find a second key in a's shard
-	}
-	s.Set(a, "1")
-	s.Set(b, "1")
-
-	done := make(chan int, 1)
-	go func() {
-		n, _ := s.Del(a, a, b)
-		done <- n
-	}()
-	select {
-	case n := <-done:
-		if n != 2 {
-			t.Fatalf("Del(a, a, b) = %d, want 2", n)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("DEL deadlocked on keys in the same shard")
-	}
-}
-
-// A shard must fill whole cache lines, or neighbouring shards' locks share
-// a line and slow each other down (false sharing). See the shard type.
-func TestShardIsOneCacheLine(t *testing.T) {
-	if size := unsafe.Sizeof(shard{}); size != 128 {
-		t.Fatalf("shard is %d bytes, want 128: adjust the padding", size)
+	s.removeExpired()
+	if s.raw("k") != nil {
+		t.Fatal("active expiry didn't remove the expired key")
 	}
 }

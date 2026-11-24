@@ -72,15 +72,11 @@ func normalizeRange(start, stop, n int) (int, int, bool) {
 }
 
 // lookupZSet returns the live sorted set at key. A missing or expired key
-// gives (nil, nil); a key of another type gives errWrongType.
-// Caller must hold sh.mu.
-func (sh *shard) lookupZSet(key string) (*zset, error) {
-	if sh.isExpired(key, time.Now()) {
-		sh.deleteKey(key)
-		return nil, nil
-	}
-	value, exists := sh.data[key]
-	if !exists {
+// gives (nil, nil); a key of another type gives errWrongType. It doesn't
+// change the maps, so it works under either lock.
+func (s *Store) lookupZSet(key string) (*zset, error) {
+	value, ok := s.live(key, time.Now())
+	if !ok {
 		return nil, nil
 	}
 	if value.typ != ZSetType {
@@ -91,11 +87,12 @@ func (sh *shard) lookupZSet(key string) (*zset, error) {
 
 // ZAdd adds or updates members and returns how many were new.
 func (s *Store) ZAdd(key string, members []ZMember) (int, error) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	z, err := sh.lookupZSet(key)
+	// An expired key must go first, or the new set would keep its TTL.
+	s.dropIfExpired(key, time.Now())
+	z, err := s.lookupZSet(key)
 	if err != nil {
 		return 0, err
 	}
@@ -112,7 +109,7 @@ func (s *Store) ZAdd(key string, members []ZMember) (int, error) {
 
 	if z == nil {
 		z = newZSet()
-		sh.data[key] = &Value{typ: ZSetType, zset: z}
+		s.data[key] = &Value{typ: ZSetType, zset: z}
 	}
 
 	added := 0
@@ -127,11 +124,10 @@ func (s *Store) ZAdd(key string, members []ZMember) (int, error) {
 // ZRem removes members and returns how many existed. Like lists, a sorted
 // set that becomes empty is deleted.
 func (s *Store) ZRem(key string, members ...string) (int, error) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	z, err := sh.lookupZSet(key)
+	z, err := s.lookupZSet(key)
 	if err != nil || z == nil {
 		return 0, err
 	}
@@ -146,17 +142,16 @@ func (s *Store) ZRem(key string, members ...string) (int, error) {
 		}
 	}
 	if len(z.scores) == 0 {
-		sh.deleteKey(key)
+		s.deleteKey(key)
 	}
 	return removed, nil
 }
 
 func (s *Store) ZScore(key, member string) (float64, bool, error) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	z, err := sh.lookupZSet(key)
+	z, err := s.lookupZSet(key)
 	if err != nil || z == nil {
 		return 0, false, err
 	}
@@ -165,11 +160,10 @@ func (s *Store) ZScore(key, member string) (float64, bool, error) {
 }
 
 func (s *Store) ZCard(key string) (int, error) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	z, err := sh.lookupZSet(key)
+	z, err := s.lookupZSet(key)
 	if err != nil || z == nil {
 		return 0, err
 	}
@@ -178,11 +172,10 @@ func (s *Store) ZCard(key string) (int, error) {
 
 // ZRank returns member's 0-based position in score order.
 func (s *Store) ZRank(key, member string) (int, bool, error) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	z, err := sh.lookupZSet(key)
+	z, err := s.lookupZSet(key)
 	if err != nil || z == nil {
 		return 0, false, err
 	}
@@ -197,11 +190,10 @@ func (s *Store) ZRank(key, member string) (int, bool, error) {
 // order. It finds the first node by rank in O(log n), then walks level 0,
 // so the cost is O(log n + count).
 func (s *Store) ZRange(key string, start, stop int) ([]ZMember, error) {
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	z, err := sh.lookupZSet(key)
+	z, err := s.lookupZSet(key)
 	if err != nil || z == nil {
 		return nil, err
 	}
