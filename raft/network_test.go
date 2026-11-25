@@ -60,6 +60,12 @@ func (n *network) setUnreliable(on bool) {
 	n.unreliable = on
 }
 
+func (n *network) isConnected(id int) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.connected[id]
+}
+
 // canTalk reports whether a message can go from one node to another.
 // Caller must hold n.mu.
 func (n *network) canTalk(from, to int) bool {

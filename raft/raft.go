@@ -31,7 +31,14 @@ type Node struct {
 
 	lastHeard time.Time     // last heartbeat from a leader, or last vote we granted
 	timeout   time.Duration // how long we wait before starting an election
+
+	done chan struct{} // closed by Stop
 }
+
+const (
+	tickInterval      = 10 * time.Millisecond // how often we check the election timer
+	heartbeatInterval = 50 * time.Millisecond // well below the 150ms minimum timeout
+)
 
 func NewNode(id, size int, net Transport) *Node {
 	return &Node{
@@ -41,7 +48,21 @@ func NewNode(id, size int, net Transport) *Node {
 		votedFor:  -1,
 		lastHeard: time.Now(),
 		timeout:   randomTimeout(),
+		done:      make(chan struct{}),
 	}
+}
+
+// Start runs the node in the background until Stop.
+func (r *Node) Start() { go r.run() }
+
+// Stop ends the node's background loops.
+func (r *Node) Stop() { close(r.done) }
+
+// State reports the node's term and whether it thinks it is the leader.
+func (r *Node) State() (term int, isLeader bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.currentTerm, r.role == leader
 }
 
 // randomTimeout picks an election timeout in [150ms, 300ms). Each node
@@ -118,4 +139,112 @@ func (r *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	r.role = follower
 	r.lastHeard = time.Now()
 	return AppendEntriesReply{Term: r.currentTerm, Success: true}
+}
+
+// --- election ---
+
+// run checks the election timer every tick. A follower or candidate that
+// hasn't heard from a leader for its whole timeout starts an election.
+// A leader has no timer: it is the one sending heartbeats.
+func (r *Node) run() {
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.done:
+			return
+		case <-ticker.C:
+		}
+		r.mu.Lock()
+		if r.role != leader && time.Since(r.lastHeard) >= r.timeout {
+			r.startElection()
+		}
+		r.mu.Unlock()
+	}
+}
+
+// startElection becomes a candidate in a new term and asks every peer for
+// a vote. Caller holds mu. The RPCs run in their own goroutines, which
+// take mu only after the reply arrives: never hold the lock during an RPC.
+func (r *Node) startElection() {
+	r.currentTerm++
+	r.role = candidate
+	r.votedFor = r.id
+	r.lastHeard = time.Now()
+	r.timeout = randomTimeout() // if this vote splits, retry after a new random wait
+
+	term := r.currentTerm
+	lastIndex, lastTerm := r.lastLog()
+	args := RequestVoteArgs{Term: term, CandidateID: r.id, LastLogIndex: lastIndex, LastLogTerm: lastTerm}
+	votes := 1 // our own; only touched while holding mu
+
+	for peer := 0; peer < r.size; peer++ {
+		if peer == r.id {
+			continue
+		}
+		go func() {
+			reply, ok := r.net.RequestVote(peer, args)
+			if !ok {
+				return
+			}
+			r.mu.Lock()
+			defer r.mu.Unlock()
+
+			if reply.Term > r.currentTerm {
+				r.stepDown(reply.Term)
+				return
+			}
+			// The reply may arrive late. If we have since won, lost, or
+			// moved to a newer term, this vote belongs to an old election.
+			if r.role != candidate || r.currentTerm != term || !reply.VoteGranted {
+				return
+			}
+			votes++
+			if votes > r.size/2 { // a majority: 2 of 3, 3 of 5
+				r.role = leader
+				go r.sendHeartbeats(term)
+			}
+		}()
+	}
+}
+
+// sendHeartbeats sends an empty AppendEntries to every peer every
+// heartbeatInterval, for as long as we are leader of term.
+func (r *Node) sendHeartbeats(term int) {
+	for {
+		r.mu.Lock()
+		if r.role != leader || r.currentTerm != term {
+			r.mu.Unlock()
+			return
+		}
+		// We are hearing from the leader: ourselves. If we step down later,
+		// our election timer then starts fresh instead of having long run
+		// out, so we give the new leader a chance before running again.
+		r.lastHeard = time.Now()
+		args := AppendEntriesArgs{Term: term, LeaderID: r.id}
+		r.mu.Unlock()
+
+		for peer := 0; peer < r.size; peer++ {
+			if peer == r.id {
+				continue
+			}
+			go func() {
+				reply, ok := r.net.AppendEntries(peer, args)
+				if !ok {
+					return
+				}
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				if reply.Term > r.currentTerm { // a newer leader exists
+					r.stepDown(reply.Term)
+				}
+			}()
+		}
+
+		select {
+		case <-r.done:
+			return
+		case <-time.After(heartbeatInterval):
+		}
+	}
 }
