@@ -123,21 +123,48 @@ func (r *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	return RequestVoteReply{Term: r.currentTerm, VoteGranted: true}
 }
 
-// HandleAppendEntries handles heartbeats. Log replication is milestone 3.
+// HandleAppendEntries accepts entries from the leader if our log matches
+// its log up to PrevLogIndex (Figure 2). With no entries it is just a
+// heartbeat, but the same check still runs.
 func (r *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// 1. A leader from an old term is out of date: refuse, and send our
+	//    term back so it steps down.
 	if args.Term < r.currentTerm {
 		return AppendEntriesReply{Term: r.currentTerm}
 	}
 	if args.Term > r.currentTerm {
 		r.stepDown(args.Term)
 	}
-	// A valid leader exists for this term. A candidate in the same term
-	// lost the race, so it goes back to being a follower.
+	// This is the real leader for our term, even if the check below fails.
+	// A candidate in the same term lost the race, so it becomes a follower.
 	r.role = follower
 	r.lastHeard = time.Now()
+
+	// 2. We must have the entry just before the new ones, with the same
+	//    term. Otherwise our logs differ somewhere before it, and the leader
+	//    will retry from one entry earlier.
+	if args.PrevLogIndex > len(r.log) ||
+		(args.PrevLogIndex > 0 && r.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+		return AppendEntriesReply{Term: r.currentTerm}
+	}
+
+	// 3-4. Walk the new entries. Skip the ones we already have. At the
+	//      first one we don't have, or one that conflicts (same index,
+	//      different term), cut our log there and append the rest.
+	for i, e := range args.Entries {
+		index := args.PrevLogIndex + 1 + i
+		if index <= len(r.log) {
+			if r.log[index-1].Term == e.Term {
+				continue
+			}
+			r.log = r.log[:index-1] // drop the conflicting entry and everything after it
+		}
+		r.log = append(r.log, args.Entries[i:]...)
+		break
+	}
 	return AppendEntriesReply{Term: r.currentTerm, Success: true}
 }
 

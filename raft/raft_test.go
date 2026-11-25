@@ -1,6 +1,9 @@
 package raft
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // voter builds a node in term 5 that has voted for votedFor (-1: nobody)
 // and whose last log entry is index 2, term 3.
@@ -81,5 +84,68 @@ func TestHeartbeat(t *testing.T) {
 	}
 	if r.role != follower {
 		t.Fatal("candidate didn't step down for the current term's leader")
+	}
+}
+
+// terms lists the term of each log entry, which is all these tests compare.
+func terms(log []LogEntry) []int {
+	out := []int{}
+	for _, e := range log {
+		out = append(out, e.Term)
+	}
+	return out
+}
+
+func entries(ts ...int) []LogEntry {
+	out := []LogEntry{}
+	for _, t := range ts {
+		out = append(out, LogEntry{Term: t})
+	}
+	return out
+}
+
+func TestHandleAppendEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    AppendEntriesArgs // Term is always 2
+		success bool
+		wantLog []int
+	}{
+		{"heartbeat, empty prefix", AppendEntriesArgs{}, true, []int{1, 1, 2}},
+		{"heartbeat, matching prefix", AppendEntriesArgs{PrevLogIndex: 3, PrevLogTerm: 2}, true, []int{1, 1, 2}},
+		{"prev beyond our log", AppendEntriesArgs{PrevLogIndex: 5, PrevLogTerm: 2, Entries: entries(2)}, false, []int{1, 1, 2}},
+		{"prev term differs", AppendEntriesArgs{PrevLogIndex: 3, PrevLogTerm: 1, Entries: entries(2)}, false, []int{1, 1, 2}},
+		{"append at the end", AppendEntriesArgs{PrevLogIndex: 3, PrevLogTerm: 2, Entries: entries(2, 2)}, true, []int{1, 1, 2, 2, 2}},
+		{"conflict: overwrite the tail", AppendEntriesArgs{PrevLogIndex: 1, PrevLogTerm: 1, Entries: entries(2)}, true, []int{1, 2}},
+		{"from the start", AppendEntriesArgs{Entries: entries(2, 2)}, true, []int{2, 2}},
+		// A delayed, older copy of a request must not cut off entries we got later.
+		{"old duplicate keeps later entries", AppendEntriesArgs{PrevLogIndex: 1, PrevLogTerm: 1, Entries: entries(1)}, true, []int{1, 1, 2}},
+		{"overlap then new", AppendEntriesArgs{PrevLogIndex: 1, PrevLogTerm: 1, Entries: entries(1, 2, 2)}, true, []int{1, 1, 2, 2}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewNode(0, 3, nil)
+			r.currentTerm = 2
+			r.log = entries(1, 1, 2)
+			tc.args.Term = 2
+
+			reply := r.HandleAppendEntries(tc.args)
+			if reply.Success != tc.success {
+				t.Fatalf("success=%v, want %v", reply.Success, tc.success)
+			}
+			if got := terms(r.log); !slices.Equal(got, tc.wantLog) {
+				t.Fatalf("log terms %v, want %v", got, tc.wantLog)
+			}
+		})
+	}
+}
+
+// A stale leader is refused and its entries are not stored.
+func TestAppendEntriesStaleTerm(t *testing.T) {
+	r := NewNode(0, 3, nil)
+	r.currentTerm = 3
+	reply := r.HandleAppendEntries(AppendEntriesArgs{Term: 2, Entries: entries(2)})
+	if reply.Success || reply.Term != 3 || len(r.log) != 0 {
+		t.Fatalf("reply %+v, log %v; want refused with term 3 and empty log", reply, terms(r.log))
 	}
 }
