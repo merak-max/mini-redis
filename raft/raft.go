@@ -2,6 +2,7 @@ package raft
 
 import (
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 )
@@ -32,6 +33,10 @@ type Node struct {
 	lastHeard time.Time     // last heartbeat from a leader, or last vote we granted
 	timeout   time.Duration // how long we wait before starting an election
 
+	// Leader only, reset each time we win an election. Indexed by peer id.
+	nextIndex  []int // next log index to send to that peer: our guess
+	matchIndex []int // highest index known to be stored on that peer: a fact
+
 	done chan struct{} // closed by Stop
 }
 
@@ -52,8 +57,8 @@ func NewNode(id, size int, net Transport) *Node {
 	}
 }
 
-// Start runs the node in the background until Stop.
-func (r *Node) Start() { go r.run() }
+// Run starts the node in the background until Stop.
+func (r *Node) Run() { go r.electionLoop() }
 
 // Stop ends the node's background loops.
 func (r *Node) Stop() { close(r.done) }
@@ -72,13 +77,33 @@ func randomTimeout() time.Duration {
 	return 150*time.Millisecond + rand.N(150*time.Millisecond)
 }
 
+// termAt returns the term of entry index, or 0 for index 0 ("before the
+// first entry"). Caller holds mu.
+func (r *Node) termAt(index int) int {
+	if index == 0 {
+		return 0
+	}
+	return r.log[index-1].Term
+}
+
 // lastLog returns the index and term of the last log entry, or 0, 0 for
 // an empty log.
 func (r *Node) lastLog() (index, term int) {
-	if len(r.log) == 0 {
-		return 0, 0
+	return len(r.log), r.termAt(len(r.log))
+}
+
+// Start asks the leader to add command to the log. It returns the index
+// the command will have if it is committed. It returns isLeader false on
+// any other node: the caller must find the leader and try there. Start
+// doesn't wait: the replication loop sends the entry within one heartbeat.
+func (r *Node) Start(command []byte) (index, term int, isLeader bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.role != leader {
+		return 0, r.currentTerm, false
 	}
-	return len(r.log), r.log[len(r.log)-1].Term
+	r.log = append(r.log, LogEntry{Term: r.currentTerm, Command: command})
+	return len(r.log), r.currentTerm, true
 }
 
 // stepDown moves to a newer term as a follower. Our vote was for the old
@@ -146,8 +171,7 @@ func (r *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	// 2. We must have the entry just before the new ones, with the same
 	//    term. Otherwise our logs differ somewhere before it, and the leader
 	//    will retry from one entry earlier.
-	if args.PrevLogIndex > len(r.log) ||
-		(args.PrevLogIndex > 0 && r.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+	if args.PrevLogIndex > len(r.log) || r.termAt(args.PrevLogIndex) != args.PrevLogTerm {
 		return AppendEntriesReply{Term: r.currentTerm}
 	}
 
@@ -170,10 +194,10 @@ func (r *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 // --- election ---
 
-// run checks the election timer every tick. A follower or candidate that
+// electionLoop checks the election timer every tick. A follower or candidate that
 // hasn't heard from a leader for its whole timeout starts an election.
 // A leader has no timer: it is the one sending heartbeats.
-func (r *Node) run() {
+func (r *Node) electionLoop() {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	for {
@@ -228,16 +252,36 @@ func (r *Node) startElection() {
 			}
 			votes++
 			if votes > r.size/2 { // a majority: 2 of 3, 3 of 5
-				r.role = leader
-				go r.sendHeartbeats(term)
+				r.becomeLeader()
 			}
 		}()
 	}
 }
 
-// sendHeartbeats sends an empty AppendEntries to every peer every
-// heartbeatInterval, for as long as we are leader of term.
-func (r *Node) sendHeartbeats(term int) {
+// becomeLeader starts leading currentTerm. We don't know what followers
+// have, so we guess they match us (nextIndex = after our last entry) and
+// let failed checks walk the guess back. We know nothing is stored
+// anywhere yet, so matchIndex starts at 0. Caller holds mu.
+func (r *Node) becomeLeader() {
+	r.becomeLeaderState()
+	go r.replicate(r.currentTerm)
+}
+
+// becomeLeaderState is becomeLeader without starting the loop, so tests
+// can drive sendEntries by hand. Caller holds mu.
+func (r *Node) becomeLeaderState() {
+	r.role = leader
+	r.nextIndex = make([]int, r.size)
+	r.matchIndex = make([]int, r.size)
+	for peer := range r.nextIndex {
+		r.nextIndex[peer] = len(r.log) + 1
+	}
+}
+
+// replicate sends every peer the entries it is missing, every
+// heartbeatInterval, for as long as we are leader of term. A peer that is
+// up to date gets no entries: that is the heartbeat.
+func (r *Node) replicate(term int) {
 	for {
 		r.mu.Lock()
 		if r.role != leader || r.currentTerm != term {
@@ -248,25 +292,12 @@ func (r *Node) sendHeartbeats(term int) {
 		// our election timer then starts fresh instead of having long run
 		// out, so we give the new leader a chance before running again.
 		r.lastHeard = time.Now()
-		args := AppendEntriesArgs{Term: term, LeaderID: r.id}
-		r.mu.Unlock()
-
 		for peer := 0; peer < r.size; peer++ {
-			if peer == r.id {
-				continue
+			if peer != r.id {
+				r.sendEntries(peer, term)
 			}
-			go func() {
-				reply, ok := r.net.AppendEntries(peer, args)
-				if !ok {
-					return
-				}
-				r.mu.Lock()
-				defer r.mu.Unlock()
-				if reply.Term > r.currentTerm { // a newer leader exists
-					r.stepDown(reply.Term)
-				}
-			}()
 		}
+		r.mu.Unlock()
 
 		select {
 		case <-r.done:
@@ -274,4 +305,50 @@ func (r *Node) sendHeartbeats(term int) {
 		case <-time.After(heartbeatInterval):
 		}
 	}
+}
+
+// sendEntries sends peer everything from nextIndex[peer] on, and updates
+// what we know about peer from the reply. Caller holds mu; the RPC runs
+// in its own goroutine without it.
+func (r *Node) sendEntries(peer, term int) {
+	prev := r.nextIndex[peer] - 1
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderID:     r.id,
+		PrevLogIndex: prev,
+		PrevLogTerm:  r.termAt(prev),
+		// A copy taken under the lock. The RPC runs after we unlock, and
+		// if we step down, a new leader may overwrite this part of our log.
+		Entries: slices.Clone(r.log[prev:]),
+	}
+
+	go func() {
+		reply, ok := r.net.AppendEntries(peer, args)
+		if !ok {
+			return
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		if reply.Term > r.currentTerm { // a newer leader exists
+			r.stepDown(reply.Term)
+			return
+		}
+		if r.role != leader || r.currentTerm != term {
+			return // a reply to an old term's request
+		}
+		if reply.Success {
+			// The peer now matches us up to the last entry we sent. Replies
+			// can arrive out of order, so never move backwards.
+			if match := prev + len(args.Entries); match > r.matchIndex[peer] {
+				r.matchIndex[peer] = match
+				r.nextIndex[peer] = match + 1
+			}
+		} else if r.nextIndex[peer] == prev+1 {
+			// The peer doesn't have entry prev with our term: try one
+			// earlier. Only if this reply is about our current guess; a
+			// late refusal of a guess we've already moved past means nothing.
+			r.nextIndex[peer] = prev
+		}
+	}()
 }

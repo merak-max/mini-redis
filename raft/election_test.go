@@ -15,7 +15,7 @@ func newCluster(t *testing.T, size int) (*network, []*Node) {
 		net.add(i, nodes[i])
 	}
 	for _, r := range nodes {
-		r.Start()
+		r.Run()
 	}
 	t.Cleanup(func() {
 		for _, r := range nodes {
