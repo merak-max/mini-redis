@@ -77,12 +77,21 @@ func TestSampledExpirationMixedKeys(t *testing.T) {
 		s.Set(key, "value")
 	}
 
+	// Keys with a TTL that hasn't passed are in the expires map, so the
+	// sampler sees them and must leave them alone.
+	for i := 0; i < 10; i++ {
+		s.SetWithTTL(fmt.Sprintf("future%d", i), "value", time.Hour)
+	}
+
 	time.Sleep(150 * time.Millisecond)
 	s.removeExpired()
 
 	for i := 0; i < 10; i++ {
 		if s.raw(fmt.Sprintf("live%d", i)) == nil {
 			t.Fatalf("Live key live%d was incorrectly deleted", i)
+		}
+		if s.raw(fmt.Sprintf("future%d", i)) == nil {
+			t.Fatalf("Key future%d with a future TTL was deleted", i)
 		}
 	}
 
